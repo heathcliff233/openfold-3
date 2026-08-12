@@ -29,7 +29,6 @@ from openfold3.core.model.layers.sequence_local_atom_attention import (
     AtomAttentionEncoder,
 )
 from openfold3.core.model.primitives import Linear
-from openfold3.core.utils.relpos import relpos_complex
 from openfold3.core.utils.tensor_utils import add
 
 
@@ -146,26 +145,53 @@ class InputEmbedderAllAtom(nn.Module):
         # [*, N_token, C_s]
         s = self.linear_s(s_input)
 
+        z = self.embed_z(
+            batch=batch, s_input=s_input, dtype=s.dtype, inplace_safe=inplace_safe
+        )
+
+        return s_input, s, z
+
+    def embed_z(
+        self,
+        batch: dict,
+        s_input: torch.Tensor,
+        dtype: torch.dtype,
+        inplace_safe: bool = False,
+    ) -> torch.Tensor:
+        """Build the input pair representation from cached single input features."""
         s_input_emb_i = self.linear_z_i(s_input)
         s_input_emb_j = self.linear_z_j(s_input)
-        token_bonds_emb = self.linear_token_bonds(
-            batch["token_bonds"].unsqueeze(-1).to(dtype=s.dtype)
-        )
 
         # [*, N_token, N_token, C_z]
         z = s_input_emb_i[..., None, :] + s_input_emb_j[..., None, :, :]
+        del s_input_emb_i, s_input_emb_j
 
-        relpos_feats = relpos_complex(
-            batch=batch,
-            max_relative_idx=self.max_relative_idx,
-            max_relative_chain=self.max_relative_chain,
-        ).to(dtype=z.dtype)
-        relpos_emb = self.linear_relpos(relpos_feats)
-        z = add(z, relpos_emb, inplace=inplace_safe)
+        # Inference: bias-free 1->C token-bonds is x * W[0], so fold in with
+        # addmm_ and avoid a pair-sized linear output.
+        token_bonds = batch["token_bonds"].to(dtype=dtype)
+        if not torch.is_grad_enabled() and self.linear_token_bonds.bias is None:
+            z.view(-1, z.shape[-1]).addmm_(
+                token_bonds.reshape(-1, 1),
+                self.linear_token_bonds.weight[:, 0].unsqueeze(0),
+            )
+        else:
+            token_bonds_emb = self.linear_token_bonds(token_bonds.unsqueeze(-1))
+            z = add(z, token_bonds_emb, inplace=inplace_safe)
+            del token_bonds_emb
+        del token_bonds
 
-        z = add(z, token_bonds_emb, inplace=inplace_safe)
+        from openfold3.core.kernels.triton.fused_relpos_embed import (
+            add_relpos_pair_embedding,
+        )
 
-        return s_input, s, z
+        return add_relpos_pair_embedding(
+            z,
+            self.linear_relpos,
+            batch,
+            self.max_relative_idx,
+            self.max_relative_chain,
+            inplace_safe=inplace_safe,
+        )
 
 
 class MSAModuleEmbedder(nn.Module):
