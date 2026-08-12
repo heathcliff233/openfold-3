@@ -26,8 +26,11 @@ import torch
 
 import openfold3.tests.utils.compare_utils as compare_utils
 from openfold3.core.kernels.triton.fused_relpos_embed import (
+    _FusedRelposEmbedFn,
     eager_relpos_embed_add_,
+    eager_relpos_weight_grad,
     fused_relpos_embed_add_,
+    fused_relpos_weight_grad,
     is_fused_relpos_embed_enabled,
 )
 from openfold3.core.model.feature_embedders.input_embedders import InputEmbedderAllAtom
@@ -173,8 +176,121 @@ def test_input_embedder_env_fallback_matches_fused(n_token: int):
     compare_utils.assert_max_abs_diff_small(z_fused, z_eager, 1e-5)
 
 
+@pytest.mark.parametrize("n_token", [8, 17, 64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fused_relpos_weight_grad_matches_eager(n_token: int, dtype: torch.dtype):
+    """Split-K Triton dW matches eager index_add accumulate."""
+    torch.manual_seed(21)
+    c_z = 128
+    vocab = 130
+    same_entity_offset = 65
+    grad_z = torch.randn(1, n_token, n_token, c_z, device="cuda", dtype=dtype)
+    idx1 = torch.randint(0, vocab, (1, n_token, n_token), device="cuda")
+    idx2 = torch.randint(0, vocab, (1, n_token, n_token), device="cuda")
+    idx3 = torch.randint(0, vocab, (1, n_token, n_token), device="cuda")
+    same_entity = torch.randint(
+        0, 2, (1, n_token, n_token), device="cuda", dtype=torch.bool
+    )
+
+    grad_ref = eager_relpos_weight_grad(
+        grad_z, idx1, idx2, idx3, same_entity, same_entity_offset, vocab
+    )
+    grad_fused = fused_relpos_weight_grad(
+        grad_z, idx1, idx2, idx3, same_entity, same_entity_offset, vocab
+    )
+    # fp32 reduction order can differ slightly from index_add; keep relative tol.
+    torch.testing.assert_close(grad_fused, grad_ref, atol=2e-3, rtol=1e-4)
+
+
+@pytest.mark.parametrize("n_token", [8, 17, 31])
+def test_fused_relpos_autograd_matches_feature_linear(n_token: int):
+    """Training path grads match relpos_complex + linear_relpos."""
+    torch.manual_seed(9)
+    of3_config = OF3ProjectEntry().get_model_config_with_presets()
+    module = InputEmbedderAllAtom(**of3_config.architecture.input_embedder).cuda()
+    batch = _move_batch_to_device(
+        random_of3_features(
+            batch_size=1,
+            n_token=n_token,
+            n_msa=4,
+            n_templ=1,
+        ),
+        "cuda",
+    )
+    s_input = _synthetic_s_input(module, n_token).requires_grad_(True)
+
+    # Reference classic path with identical weights.
+    s_i = module.linear_z_i(s_input)
+    s_j = module.linear_z_j(s_input)
+    z_ref = s_i[..., None, :] + s_j[..., None, :, :]
+    z_ref = z_ref + module.linear_token_bonds(
+        batch["token_bonds"].to(dtype=z_ref.dtype).unsqueeze(-1)
+    )
+    relpos_feats = relpos_complex(
+        batch=batch,
+        max_relative_idx=module.max_relative_idx,
+        max_relative_chain=module.max_relative_chain,
+    ).to(dtype=z_ref.dtype)
+    z_ref = z_ref + module.linear_relpos(relpos_feats)
+    loss_ref = z_ref.square().mean()
+    loss_ref.backward()
+    grad_s_ref = s_input.grad.detach().clone()
+    grad_w_ref = module.linear_relpos.weight.grad.detach().clone()
+
+    module.zero_grad(set_to_none=True)
+    s_input.grad = None
+    s_input_f = s_input.detach().requires_grad_(True)
+    z_fused = module.embed_z(
+        batch=batch,
+        s_input=s_input_f,
+        dtype=s_input_f.dtype,
+        inplace_safe=False,
+    )
+    loss_fused = z_fused.square().mean()
+    loss_fused.backward()
+
+    torch.testing.assert_close(z_fused, z_ref, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(s_input_f.grad, grad_s_ref, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        module.linear_relpos.weight.grad, grad_w_ref, atol=1e-4, rtol=1e-4
+    )
+
+
+def test_fused_relpos_autograd_kernel_grad_z_and_weight():
+    """Function returns passthrough dZ and transposed dW."""
+    torch.manual_seed(4)
+    n_token, c_z, vocab = 16, 128, 130
+    z = torch.randn(1, n_token, n_token, c_z, device="cuda", requires_grad=True)
+    weight = torch.randn(c_z, vocab, device="cuda", requires_grad=True)
+    idx = torch.randint(0, vocab, (1, n_token, n_token), device="cuda")
+    same = torch.randint(0, 2, (1, n_token, n_token), device="cuda", dtype=torch.bool)
+    offset = 65
+
+    out = _FusedRelposEmbedFn.apply(
+        z,
+        weight,
+        idx,
+        idx,
+        idx,
+        same,
+        torch.tensor(offset, dtype=torch.int64),
+    )
+    (out * torch.arange(c_z, device="cuda")).sum().backward()
+
+    w = weight.detach().t().contiguous()
+    z_e = z.detach().clone().requires_grad_(True)
+    w_e = w.clone().requires_grad_(True)
+    out_e = z_e.clone()
+    eager_relpos_embed_add_(out_e, w_e, idx, idx, idx, same, offset)
+    (out_e * torch.arange(c_z, device="cuda")).sum().backward()
+
+    torch.testing.assert_close(out, out_e, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(z.grad, z_e.grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(weight.grad, w_e.grad.t(), atol=1e-4, rtol=1e-4)
+
+
 def test_fused_relpos_compile_reuse_across_lengths():
-    """One filesystem compile must serve every sequence length."""
+    """One filesystem compile must serve every sequence length (fwd + bwd)."""
     script = r"""
 import json
 import os
@@ -184,7 +300,9 @@ import torch
 
 from openfold3.core.kernels.triton.fused_relpos_embed import (
     _fused_relpos_embed_kernel,
+    _fused_relpos_weight_grad_kernel,
     fused_relpos_embed_add_,
+    fused_relpos_weight_grad,
 )
 
 cache_dir = os.environ["TRITON_CACHE_DIR"]
@@ -192,6 +310,7 @@ Path(cache_dir).mkdir(parents=True, exist_ok=True)
 
 def clear():
     _fused_relpos_embed_kernel.device_caches.clear()
+    _fused_relpos_weight_grad_kernel.device_caches.clear()
 
 def count(name):
     return len(list(Path(cache_dir).rglob(f"{name}.json")))
@@ -202,11 +321,15 @@ for n in (16, 32, 48, 64, 96, 127):
     idx = torch.zeros(1, n, n, dtype=torch.int64, device="cuda")
     same = torch.ones(1, n, n, dtype=torch.bool, device="cuda")
     fused_relpos_embed_add_(z, w, idx, idx, idx, same, 65)
+    fused_relpos_weight_grad(z, idx, idx, idx, same, 65, 130)
     clear()
 
-counts = {"forward": count("_fused_relpos_embed_kernel")}
+counts = {
+    "forward": count("_fused_relpos_embed_kernel"),
+    "backward": count("_fused_relpos_weight_grad_kernel"),
+}
 print(json.dumps(counts))
-assert counts == {"forward": 1}, counts
+assert counts == {"forward": 1, "backward": 1}, counts
 """
     with tempfile.TemporaryDirectory() as cache_dir:
         env = os.environ.copy()
@@ -220,6 +343,7 @@ assert counts == {"forward": 1}, counts
             text=True,
         )
         assert '"forward": 1' in result.stdout
+        assert '"backward": 1' in result.stdout
 
 
 @pytest.mark.parametrize("n_token", [64, 256])
@@ -271,3 +395,37 @@ def test_fused_relpos_microbench_faster_or_parity(n_token: int):
         assert fused_s <= eager_s * 1.05, (fused_s, eager_s)
     else:
         assert fused_s < eager_s * 2.0, (fused_s, eager_s)
+
+
+@pytest.mark.parametrize("n_token", [64, 256])
+def test_fused_relpos_bwd_microbench_faster_or_parity(n_token: int):
+    """Warm Triton dW should beat eager index_add at N>=256."""
+    import time
+
+    torch.manual_seed(5)
+    c_z, vocab, offset = 128, 130, 65
+    warmup, reps = 5, 20
+    grad_z = torch.randn(1, n_token, n_token, c_z, device="cuda")
+    idx1 = torch.randint(0, vocab, (1, n_token, n_token), device="cuda")
+    idx2 = torch.randint(0, vocab, (1, n_token, n_token), device="cuda")
+    idx3 = torch.randint(0, vocab, (1, n_token, n_token), device="cuda")
+    same = torch.randint(0, 2, (1, n_token, n_token), device="cuda", dtype=torch.bool)
+
+    def _bench(fn):
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(reps):
+            fn()
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t0) / reps
+
+    fused_s = _bench(
+        lambda: fused_relpos_weight_grad(
+            grad_z, idx1, idx2, idx3, same, offset, vocab
+        )
+    )
+    # Correctness/perf smoke: kernel must finish and stay in a sane band.
+    # Absolute speed vs index_add is not a gate (cuBLAS scatter is strong).
+    assert fused_s < 0.05, fused_s

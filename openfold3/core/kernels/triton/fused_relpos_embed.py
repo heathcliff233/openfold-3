@@ -15,11 +15,10 @@
 # by Liang Hong <lhong22@cse.cuhk.edu.hk>: fused Triton gather-add for the
 # relative-position embedding tables used by the input embedder.
 
-"""Fused relpos gather-add for the input embedder (inference path).
+"""Fused relpos gather-add (forward + split-K weight backward).
 
-In-place / out-of-place forward and a thin input-embedder wrapper. Sequence
-length is only the launch grid, so one compile serves all N. Training falls
-back to a differentiable eager gather-add until a Triton backward lands.
+In-place forward, out-of-place forward for training, and a thin input-embedder
+wrapper. Sequence length is only the launch grid, so one compile serves all N.
 """
 
 from __future__ import annotations
@@ -27,6 +26,7 @@ from __future__ import annotations
 import os
 
 import torch
+from torch.autograd.function import once_differentiable
 
 try:
     import triton
@@ -37,6 +37,9 @@ except ImportError:  # pragma: no cover
     triton = None
     tl = None
     _TRITON_AVAILABLE = False
+
+# Exclusive pair chunks (no atomics). Fixed so compiles reuse across lengths.
+_BWD_SPLIT_K = 256
 
 
 def is_fused_relpos_embed_enabled() -> bool:
@@ -106,9 +109,73 @@ if _TRITON_AVAILABLE:
         ).to(tl.float32)
         tl.store(OUT_ptr + off, z_vals.to(OUT_ptr.dtype.element_ty), mask=mask)
 
+    @triton.jit(
+        do_not_specialize=["M"],
+        do_not_specialize_on_alignment=[
+            "GRAD_ptr",
+            "IDX1_ptr",
+            "IDX2_ptr",
+            "IDX3_ptr",
+            "SAME_ENTITY_ptr",
+            "PARTIAL_ptr",
+        ],
+    )
+    def _fused_relpos_weight_grad_kernel(
+        GRAD_ptr,
+        IDX1_ptr,
+        IDX2_ptr,
+        IDX3_ptr,
+        SAME_ENTITY_ptr,
+        PARTIAL_ptr,
+        M,
+        C: tl.constexpr,
+        VOCAB: tl.constexpr,
+        SAME_ENTITY_OFFSET: tl.constexpr,
+        SPLIT_K: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+    ):
+        """Deterministic per-split accumulate (no atomics).
+
+        One program owns ``partial[split]`` and walks its pairs in order.
+        Threads only parallelize the channel axis, so load/add/store is race-free.
+        """
+        split = tl.program_id(0)
+        pairs_per_split = (M + SPLIT_K - 1) // SPLIT_K
+        split_start = split * pairs_per_split
+        split_end = tl.minimum(split_start + pairs_per_split, M)
+
+        c = tl.arange(0, BLOCK_C)
+        c_mask = c < C
+        base = PARTIAL_ptr + split * VOCAB * C
+
+        for pair in range(split_start, split_end):
+            idx1 = tl.load(IDX1_ptr + pair)
+            idx2 = tl.load(IDX2_ptr + pair)
+            idx3 = tl.load(IDX3_ptr + pair)
+            same_ent = tl.load(SAME_ENTITY_ptr + pair).to(tl.float32)
+            g = tl.load(
+                GRAD_ptr + pair * C + c, mask=c_mask, other=0.0
+            ).to(tl.float32)
+
+            p1 = base + idx1 * C + c
+            tl.store(p1, tl.load(p1, mask=c_mask, other=0.0) + g, mask=c_mask)
+            p2 = base + idx2 * C + c
+            tl.store(p2, tl.load(p2, mask=c_mask, other=0.0) + g, mask=c_mask)
+            p3 = base + idx3 * C + c
+            tl.store(p3, tl.load(p3, mask=c_mask, other=0.0) + g, mask=c_mask)
+            pe = base + SAME_ENTITY_OFFSET * C + c
+            tl.store(
+                pe,
+                tl.load(pe, mask=c_mask, other=0.0) + g * same_ent,
+                mask=c_mask,
+            )
+
 else:  # pragma: no cover
 
     def _fused_relpos_embed_kernel(*_a, **_k):
+        raise RuntimeError("Triton is required for fused_relpos_embed")
+
+    def _fused_relpos_weight_grad_kernel(*_a, **_k):
         raise RuntimeError("Triton is required for fused_relpos_embed")
 
 
@@ -165,7 +232,7 @@ def fused_relpos_embed(
     same_entity: torch.Tensor,
     same_entity_offset: int,
 ) -> torch.Tensor:
-    """Out-of-place fused gather-add."""
+    """Out-of-place fused gather-add (for training)."""
     assert z.is_contiguous(), "z must be contiguous"
     out = torch.empty_like(z)
     return _launch_forward(
@@ -187,6 +254,87 @@ def eager_relpos_embed_add_(
     z.add_(w[rel_token_idx])
     z.add_(w[rel_chain_idx])
     z.add_(same_entity[..., None].to(dtype=z.dtype) * w[same_entity_offset])
+
+
+def eager_relpos_weight_grad(
+    grad_z: torch.Tensor,
+    rel_pos_idx: torch.Tensor,
+    rel_token_idx: torch.Tensor,
+    rel_chain_idx: torch.Tensor,
+    same_entity: torch.Tensor,
+    same_entity_offset: int,
+    vocab: int,
+) -> torch.Tensor:
+    """fp32 weight-table ``dW`` baseline (same math as gather-add forward)."""
+    C = grad_z.shape[-1]
+    g = grad_z.reshape(-1, C).float()
+    grad_w = torch.zeros(vocab, C, device=grad_z.device, dtype=torch.float32)
+    grad_w.index_add_(0, rel_pos_idx.reshape(-1), g)
+    grad_w.index_add_(0, rel_token_idx.reshape(-1), g)
+    grad_w.index_add_(0, rel_chain_idx.reshape(-1), g)
+    se = same_entity.reshape(-1).to(dtype=g.dtype)
+    grad_w[same_entity_offset] += (g * se[:, None]).sum(dim=0)
+    return grad_w
+
+
+def fused_relpos_weight_grad(
+    grad_z: torch.Tensor,
+    rel_pos_idx: torch.Tensor,
+    rel_token_idx: torch.Tensor,
+    rel_chain_idx: torch.Tensor,
+    same_entity: torch.Tensor,
+    same_entity_offset: int,
+    vocab: int,
+) -> torch.Tensor:
+    """Split-K Triton ``[vocab, C]`` weight gradient (fp32 accumulate)."""
+    grad_z = grad_z.contiguous()
+    C = grad_z.shape[-1]
+    M = grad_z.numel() // C
+    partial = torch.zeros(
+        _BWD_SPLIT_K, vocab, C, device=grad_z.device, dtype=torch.float32
+    )
+    _fused_relpos_weight_grad_kernel[(_BWD_SPLIT_K,)](
+        grad_z.view(-1, C),
+        rel_pos_idx.reshape(-1).contiguous(),
+        rel_token_idx.reshape(-1).contiguous(),
+        rel_chain_idx.reshape(-1).contiguous(),
+        same_entity.reshape(-1).contiguous(),
+        partial,
+        M,
+        C=C,
+        VOCAB=vocab,
+        SAME_ENTITY_OFFSET=same_entity_offset,
+        SPLIT_K=_BWD_SPLIT_K,
+        BLOCK_C=triton.next_power_of_2(C),
+    )
+    return partial.sum(dim=0)
+
+
+class _FusedRelposEmbedFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, z, weight, idx1, idx2, idx3, same_entity, offset):
+        w = weight.to(dtype=z.dtype).t().contiguous()
+        out = fused_relpos_embed(
+            z, w, idx1, idx2, idx3, same_entity, int(offset.item())
+        )
+        ctx.save_for_backward(idx1, idx2, idx3, same_entity)
+        ctx.offset = int(offset.item())
+        ctx.vocab = weight.shape[1]
+        ctx.weight_dtype = weight.dtype
+        return out
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_out):
+        idx1, idx2, idx3, same_entity = ctx.saved_tensors
+        grad_z = grad_out if ctx.needs_input_grad[0] else None
+        grad_weight = None
+        if ctx.needs_input_grad[1]:
+            grad_w = fused_relpos_weight_grad(
+                grad_out, idx1, idx2, idx3, same_entity, ctx.offset, ctx.vocab
+            )
+            grad_weight = grad_w.t().to(dtype=ctx.weight_dtype).contiguous()
+        return grad_z, grad_weight, None, None, None, None, None
 
 
 def _build_indices(batch, max_relative_idx, max_relative_chain):
@@ -226,7 +374,7 @@ def add_relpos_pair_embedding(
     max_relative_chain: int,
     inplace_safe: bool = False,
 ) -> torch.Tensor:
-    """Input-embedder wrapper: classic path, fused inference, or eager training."""
+    """Input-embedder wrapper: classic path, fused inference, or fused training."""
     if linear_relpos.bias is not None:
         from openfold3.core.utils.relpos import relpos_complex
         from openfold3.core.utils.tensor_utils import add
@@ -248,7 +396,17 @@ def add_relpos_pair_embedding(
     )
 
     if use_grad:
-        # Differentiable eager fallback until Triton weight backward lands.
+        if _can_use_triton(z, w):
+            return _FusedRelposEmbedFn.apply(
+                z,
+                weight,
+                idx1,
+                idx2,
+                idx3,
+                same_entity,
+                torch.tensor(offset, dtype=torch.int64),
+            )
+        # Eager differentiable fallback (e.g. CPU).
         wt = weight.to(dtype=z.dtype).t()
         return (
             z

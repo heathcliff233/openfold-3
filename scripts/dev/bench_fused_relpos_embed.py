@@ -31,7 +31,9 @@ import torch  # noqa: E402
 
 from openfold3.core.kernels.triton.fused_relpos_embed import (  # noqa: E402
     eager_relpos_embed_add_,
+    eager_relpos_weight_grad,
     fused_relpos_embed_add_,
+    fused_relpos_weight_grad,
 )
 
 C = 128
@@ -143,6 +145,75 @@ def bench_one(N: int) -> dict:
     }
 
 
+def bench_bwd_one(N: int) -> dict:
+    torch.cuda.empty_cache()
+    grad_z = torch.randn(1, N, N, C, device="cuda", dtype=torch.float32)
+    idx1 = torch.randint(0, VOCAB, (1, N, N), device="cuda", dtype=torch.int64)
+    idx2 = torch.randint(0, VOCAB, (1, N, N), device="cuda", dtype=torch.int64)
+    idx3 = torch.randint(0, VOCAB, (1, N, N), device="cuda", dtype=torch.int64)
+    same_entity = torch.randint(0, 2, (1, N, N), device="cuda", dtype=torch.bool)
+    U_bytes = N * N * C * 4
+
+    max_err = None
+    if N <= 3000:
+        g_ref = eager_relpos_weight_grad(
+            grad_z, idx1, idx2, idx3, same_entity, SAME_ENTITY_OFFSET, VOCAB
+        )
+        g_test = fused_relpos_weight_grad(
+            grad_z, idx1, idx2, idx3, same_entity, SAME_ENTITY_OFFSET, VOCAB
+        )
+        torch.cuda.synchronize()
+        max_err = (g_test - g_ref).abs().max().item()
+        del g_ref, g_test
+
+    def _peak(fn):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        fn()
+        torch.cuda.synchronize()
+        return (torch.cuda.max_memory_allocated() - base) / U_bytes
+
+    def _time(fn):
+        for _ in range(WARMUP):
+            fn()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(REPS):
+            fn()
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t0) / REPS * 1000
+
+    eager_fn = lambda: eager_relpos_weight_grad(
+        grad_z, idx1, idx2, idx3, same_entity, SAME_ENTITY_OFFSET, VOCAB
+    )
+    fused_fn = lambda: fused_relpos_weight_grad(
+        grad_z, idx1, idx2, idx3, same_entity, SAME_ENTITY_OFFSET, VOCAB
+    )
+
+    eager_peak_U = None
+    eager_ms = None
+    try:
+        eager_peak_U = _peak(eager_fn)
+        eager_ms = _time(eager_fn)
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+
+    fused_peak_U = _peak(fused_fn)
+    fused_ms = _time(fused_fn)
+
+    del grad_z, idx1, idx2, idx3, same_entity
+    torch.cuda.empty_cache()
+    return {
+        "N": N,
+        "max_err": max_err,
+        "eager_peak_U": eager_peak_U,
+        "fused_peak_U": fused_peak_U,
+        "eager_ms": eager_ms,
+        "fused_ms": fused_ms,
+    }
+
+
 def _print_table(title: str, rows: list[dict]) -> None:
     print(title)
     print(
@@ -172,6 +243,7 @@ def _print_table(title: str, rows: list[dict]) -> None:
 def main():
     lengths = [256, 512, 1264, 2000]
     _print_table("Forward gather-add", [bench_one(N) for N in lengths])
+    _print_table("Backward weight grad", [bench_bwd_one(N) for N in lengths])
 
 
 if __name__ == "__main__":
