@@ -481,7 +481,41 @@ class PairBlock(nn.Module):
             inplace_safe=inplace_safe,
         )
 
-        z = add(
+        z = self._apply_pair_transition(
+            z=z,
+            pair_trans_mask=pair_trans_mask,
+            chunk_size=chunk_size,
+            inplace_safe=inplace_safe,
+        )
+
+        return z
+
+    def _apply_pair_transition(
+        self,
+        z: torch.Tensor,
+        pair_trans_mask: torch.Tensor | None,
+        chunk_size: int | None,
+        inplace_safe: bool,
+    ) -> torch.Tensor:
+        """Residual pair transition; fused in-place when eligible under inference."""
+        from openfold3.core.kernels.triton.fused_swiglu_transition import (
+            is_fused_swiglu_transition_enabled,
+        )
+
+        if (
+            is_fused_swiglu_transition_enabled()
+            and inplace_safe
+            and not torch.is_grad_enabled()
+            and isinstance(self.pair_transition, SwiGLUTransition)
+        ):
+            trans_mask = (
+                pair_trans_mask.unsqueeze(-1) if pair_trans_mask is not None else None
+            )
+            return self.pair_transition._transition_inplace(
+                x=z, mask=trans_mask, residual=z
+            )
+
+        return add(
             z,
             self.pair_transition(
                 z,
@@ -490,5 +524,3 @@ class PairBlock(nn.Module):
             ),
             inplace=inplace_safe,
         )
-
-        return z

@@ -264,18 +264,51 @@ class SwiGLUTransition(Transition):
             self.n * self.c_in, c_in, **linear_init_params.linear_out
         )
 
-    def _transition(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        # [*, N, C_in]
+    def _eager_transition(
+        self, x: torch.Tensor, mask: torch.Tensor | None
+    ) -> torch.Tensor:
         x = self.layer_norm(x)
-
-        # [*, N, C_hidden]
         x = self.swiglu(x)
-
-        # [*, N, C_in]
         x = self.linear_out(x)
-        x = x * mask
+        return x if mask is None else x * mask
 
-        return x
+    def _fused_weight_args(self):
+        return (
+            self.layer_norm.weight,
+            self.layer_norm.bias,
+            self.swiglu.linear_a.weight,
+            self.swiglu.linear_b.weight,
+            self.linear_out.weight,
+        )
+
+    def _transition(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        from openfold3.core.kernels.triton.fused_swiglu_transition import (
+            fused_swiglu_transition,
+            is_fused_swiglu_transition_eligible,
+        )
+
+        weights = self._fused_weight_args()
+        if is_fused_swiglu_transition_eligible(x, *weights):
+            return fused_swiglu_transition(
+                x, *weights, mask=mask, eps=self.layer_norm.eps
+            )
+        return self._eager_transition(x, mask)
+
+    def _transition_inplace(
+        self, x: torch.Tensor, mask: torch.Tensor, residual: torch.Tensor
+    ) -> torch.Tensor:
+        """Fused ``residual + transition(x)``; may write in place when residual is x."""
+        from openfold3.core.kernels.triton.fused_swiglu_transition import (
+            fused_swiglu_transition,
+            is_fused_swiglu_transition_eligible,
+        )
+
+        weights = self._fused_weight_args()
+        if is_fused_swiglu_transition_eligible(x, *weights):
+            return fused_swiglu_transition(
+                x, *weights, mask=mask, eps=self.layer_norm.eps, residual=residual
+            )
+        return residual + self._eager_transition(x, mask)
 
 
 class ConditionedTransitionBlock(nn.Module):

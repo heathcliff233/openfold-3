@@ -183,14 +183,11 @@ class TemplatePairBlock(PairBlock):
                 use_triton_triangle_kernels=use_triton_triangle_kernels,
             )
 
-        t = add(
-            t,
-            self.pair_transition(
-                t,
-                mask=mask if _mask_trans else None,
-                chunk_size=chunk_size,
-            ),
-            inplace_safe,
+        t = self._apply_pair_transition(
+            z=t,
+            pair_trans_mask=mask if _mask_trans else None,
+            chunk_size=chunk_size,
+            inplace_safe=inplace_safe,
         )
 
         return t
