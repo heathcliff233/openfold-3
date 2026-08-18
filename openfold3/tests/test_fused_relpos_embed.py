@@ -26,6 +26,7 @@ import torch
 
 import openfold3.tests.utils.compare_utils as compare_utils
 from openfold3.core.kernels.triton.fused_relpos_embed import (
+    _can_use_triton,
     _FusedRelposEmbedFn,
     eager_relpos_embed_add_,
     eager_relpos_weight_grad,
@@ -65,12 +66,12 @@ def test_fused_relpos_kernel_matches_eager(n_token: int, dtype: torch.dtype):
     idx1 = torch.randint(0, vocab, (1, n_token, n_token), device="cuda")
     idx2 = torch.randint(0, vocab, (1, n_token, n_token), device="cuda")
     idx3 = torch.randint(0, vocab, (1, n_token, n_token), device="cuda")
-    same_entity = torch.randint(0, 2, (1, n_token, n_token), device="cuda", dtype=torch.bool)
+    same_entity = torch.randint(
+        0, 2, (1, n_token, n_token), device="cuda", dtype=torch.bool
+    )
 
     z_ref = z.clone()
-    eager_relpos_embed_add_(
-        z_ref, w, idx1, idx2, idx3, same_entity, same_entity_offset
-    )
+    eager_relpos_embed_add_(z_ref, w, idx1, idx2, idx3, same_entity, same_entity_offset)
 
     z_fused = z.clone()
     fused_relpos_embed_add_(
@@ -85,6 +86,103 @@ def test_fused_relpos_kernel_matches_eager(n_token: int, dtype: torch.dtype):
         torch.testing.assert_close(z_fused.float(), z_ref.float(), atol=0.15, rtol=1e-2)
 
 
+def _set_tf32(enabled: bool) -> None:
+    torch.backends.cuda.matmul.allow_tf32 = enabled
+    torch.backends.cudnn.allow_tf32 = enabled
+
+
+def test_fused_relpos_precision_eligibility():
+    """IEEE fp32, matching bf16, and bf16-mixed are eligible; fp32+bf16 is not."""
+    z32 = torch.zeros(1, 4, 4, 128, device="cuda", dtype=torch.float32)
+    z16 = torch.zeros(1, 4, 4, 128, device="cuda", dtype=torch.bfloat16)
+    w32 = torch.zeros(130, 128, device="cuda", dtype=torch.float32)
+    w16 = torch.zeros(130, 128, device="cuda", dtype=torch.bfloat16)
+    assert _can_use_triton(z32, w32)
+    assert _can_use_triton(z16, w16)
+    assert _can_use_triton(z16, w32)
+    assert not _can_use_triton(z32, w16)
+
+
+@pytest.mark.parametrize("allow_tf32", [False, True], ids=["ieee", "tf32"])
+def test_fused_relpos_fp32_matches_eager(allow_tf32: bool):
+    """IEEE and TF32 share gather-add math; both match eager fp32."""
+    _set_tf32(allow_tf32)
+    torch.manual_seed(11)
+    n_token, c_z, vocab, offset = 16, 128, 130, 65
+    z = torch.randn(1, n_token, n_token, c_z, device="cuda")
+    w = torch.randn(vocab, c_z, device="cuda")
+    idx = torch.randint(0, vocab, (1, n_token, n_token), device="cuda")
+    same = torch.randint(0, 2, (1, n_token, n_token), device="cuda", dtype=torch.bool)
+    assert _can_use_triton(z, w)
+
+    z_ref = z.clone()
+    eager_relpos_embed_add_(z_ref, w, idx, idx, idx, same, offset)
+    z_fused = z.clone()
+    fused_relpos_embed_add_(z_fused, w, idx, idx, idx, same, offset)
+    compare_utils.assert_max_abs_diff_small(z_ref, z_fused, 1e-5)
+
+
+def test_fused_relpos_bf16_mixed_matches_fp32_ref():
+    """bf16 activations + fp32 masters match fp32 gather-add then store-cast."""
+    _set_tf32(False)
+    torch.manual_seed(12)
+    n_token, c_z, vocab, offset = 16, 128, 130, 65
+    z = torch.randn(1, n_token, n_token, c_z, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(vocab, c_z, device="cuda", dtype=torch.float32)
+    idx = torch.randint(0, vocab, (1, n_token, n_token), device="cuda")
+    same = torch.randint(0, 2, (1, n_token, n_token), device="cuda", dtype=torch.bool)
+    assert _can_use_triton(z, w)
+
+    z_ref = z.float()
+    eager_relpos_embed_add_(z_ref, w, idx, idx, idx, same, offset)
+    z_ref = z_ref.to(torch.bfloat16)
+    z_fused = z.clone()
+    fused_relpos_embed_add_(z_fused, w, idx, idx, idx, same, offset)
+    torch.testing.assert_close(z_fused.float(), z_ref.float(), atol=2e-2, rtol=1e-2)
+
+
+def test_fused_relpos_autograd_bf16_mixed():
+    """Mixed training: bf16 dZ passthrough, fp32 dW vs fp32-then-cast eager."""
+    _set_tf32(False)
+    torch.manual_seed(4)
+    n_token, c_z, vocab, offset = 16, 128, 130, 65
+    z = torch.randn(
+        1,
+        n_token,
+        n_token,
+        c_z,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    weight = torch.randn(
+        c_z, vocab, device="cuda", dtype=torch.float32, requires_grad=True
+    )
+    idx = torch.randint(0, vocab, (1, n_token, n_token), device="cuda")
+    same = torch.randint(0, 2, (1, n_token, n_token), device="cuda", dtype=torch.bool)
+
+    out = _FusedRelposEmbedFn.apply(
+        z, weight, idx, idx, idx, same, torch.tensor(offset, dtype=torch.int64)
+    )
+    scale = torch.arange(c_z, device="cuda", dtype=torch.bfloat16)
+    (out * scale).sum().backward()
+
+    w = weight.detach().t().contiguous()
+    z_ref = z.detach().float()
+    eager_relpos_embed_add_(z_ref, w, idx, idx, idx, same, offset)
+    out_ref = z_ref.to(torch.bfloat16)
+    grad_out = scale.expand_as(out).contiguous()
+    dw_ref = eager_relpos_weight_grad(grad_out, idx, idx, idx, same, offset, vocab)
+
+    assert out.dtype == torch.bfloat16
+    assert weight.grad.dtype == torch.float32
+    torch.testing.assert_close(out.float(), out_ref.float(), atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(z.grad, grad_out)
+    torch.testing.assert_close(
+        weight.grad.float(), dw_ref.t().float(), atol=5e-2, rtol=2e-2
+    )
+
+
 def _synthetic_s_input(module: InputEmbedderAllAtom, n_token: int) -> torch.Tensor:
     c_s_input = module.linear_s.weight.shape[1]
     return torch.randn(1, n_token, c_s_input, device="cuda", dtype=torch.float32)
@@ -97,7 +195,9 @@ def test_input_embedder_fused_relpos_matches_feature_linear(n_token: int):
     torch.manual_seed(7)
 
     of3_config = OF3ProjectEntry().get_model_config_with_presets()
-    module = InputEmbedderAllAtom(**of3_config.architecture.input_embedder).cuda().eval()
+    module = (
+        InputEmbedderAllAtom(**of3_config.architecture.input_embedder).cuda().eval()
+    )
     batch = _move_batch_to_device(
         random_of3_features(
             batch_size=1,
@@ -138,7 +238,9 @@ def test_input_embedder_env_fallback_matches_fused(n_token: int):
     """OPENFOLD3_FUSED_RELPOS=0 uses the eager weight-table path."""
     torch.manual_seed(13)
     of3_config = OF3ProjectEntry().get_model_config_with_presets()
-    module = InputEmbedderAllAtom(**of3_config.architecture.input_embedder).cuda().eval()
+    module = (
+        InputEmbedderAllAtom(**of3_config.architecture.input_embedder).cuda().eval()
+    )
     batch = _move_batch_to_device(
         random_of3_features(
             batch_size=1,
@@ -422,9 +524,7 @@ def test_fused_relpos_bwd_microbench_faster_or_parity(n_token: int):
         return (time.perf_counter() - t0) / reps
 
     fused_s = _bench(
-        lambda: fused_relpos_weight_grad(
-            grad_z, idx1, idx2, idx3, same, offset, vocab
-        )
+        lambda: fused_relpos_weight_grad(grad_z, idx1, idx2, idx3, same, offset, vocab)
     )
     # Correctness/perf smoke: kernel must finish and stay in a sane band.
     # Absolute speed vs index_add is not a gate (cuBLAS scatter is strong).

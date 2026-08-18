@@ -19,6 +19,11 @@
 
 In-place forward, out-of-place forward for training, and a thin input-embedder
 wrapper. Sequence length is only the launch grid, so one compile serves all N.
+
+Precision: IEEE fp32 and TF32 use fp32 activations (gather-add has no
+``tl.dot``, so TF32 does not change the math). bf16-mixed uses bf16
+activations with fp32 Parameter masters; weight tiles are upcast on load
+and ``dW`` accumulates in fp32.
 """
 
 from __future__ import annotations
@@ -54,6 +59,7 @@ def is_fused_relpos_embed_enabled() -> bool:
 
 
 def _can_use_triton(z: torch.Tensor, w: torch.Tensor) -> bool:
+    # fp32 masters + bf16 activations (mixed), or matching fp32 / bf16.
     return (
         is_fused_relpos_embed_enabled()
         and z.is_cuda
@@ -61,7 +67,7 @@ def _can_use_triton(z: torch.Tensor, w: torch.Tensor) -> bool:
         and z.is_contiguous()
         and w.is_contiguous()
         and z.dtype in (torch.float32, torch.bfloat16)
-        and w.dtype == z.dtype
+        and w.dtype in (torch.float32, z.dtype)
         and z.shape[-1] == w.shape[-1]
     )
 
@@ -104,9 +110,9 @@ if _TRITON_AVAILABLE:
         z_vals += tl.load(W_ptr + idx1 * C + c, mask=mask).to(tl.float32)
         z_vals += tl.load(W_ptr + idx2 * C + c, mask=mask).to(tl.float32)
         z_vals += tl.load(W_ptr + idx3 * C + c, mask=mask).to(tl.float32)
-        z_vals += same_ent * tl.load(
-            W_ptr + SAME_ENTITY_OFFSET * C + c, mask=mask
-        ).to(tl.float32)
+        z_vals += same_ent * tl.load(W_ptr + SAME_ENTITY_OFFSET * C + c, mask=mask).to(
+            tl.float32
+        )
         tl.store(OUT_ptr + off, z_vals.to(OUT_ptr.dtype.element_ty), mask=mask)
 
     @triton.jit(
@@ -153,9 +159,7 @@ if _TRITON_AVAILABLE:
             idx2 = tl.load(IDX2_ptr + pair)
             idx3 = tl.load(IDX3_ptr + pair)
             same_ent = tl.load(SAME_ENTITY_ptr + pair).to(tl.float32)
-            g = tl.load(
-                GRAD_ptr + pair * C + c, mask=c_mask, other=0.0
-            ).to(tl.float32)
+            g = tl.load(GRAD_ptr + pair * C + c, mask=c_mask, other=0.0).to(tl.float32)
 
             p1 = base + idx1 * C + c
             tl.store(p1, tl.load(p1, mask=c_mask, other=0.0) + g, mask=c_mask)
@@ -218,8 +222,14 @@ def fused_relpos_embed_add_(
     """In-place fused gather-add into ``z``."""
     assert z.is_contiguous(), "z must be contiguous"
     _launch_forward(
-        z, w, rel_pos_idx, rel_token_idx, rel_chain_idx, same_entity,
-        same_entity_offset, out=z,
+        z,
+        w,
+        rel_pos_idx,
+        rel_token_idx,
+        rel_chain_idx,
+        same_entity,
+        same_entity_offset,
+        out=z,
     )
 
 
@@ -236,8 +246,14 @@ def fused_relpos_embed(
     assert z.is_contiguous(), "z must be contiguous"
     out = torch.empty_like(z)
     return _launch_forward(
-        z, w, rel_pos_idx, rel_token_idx, rel_chain_idx, same_entity,
-        same_entity_offset, out=out,
+        z,
+        w,
+        rel_pos_idx,
+        rel_token_idx,
+        rel_chain_idx,
+        same_entity,
+        same_entity_offset,
+        out=out,
     )
 
 
@@ -313,7 +329,7 @@ def fused_relpos_weight_grad(
 class _FusedRelposEmbedFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, z, weight, idx1, idx2, idx3, same_entity, offset):
-        w = weight.to(dtype=z.dtype).t().contiguous()
+        w = weight.t().contiguous()
         out = fused_relpos_embed(
             z, w, idx1, idx2, idx3, same_entity, int(offset.item())
         )
@@ -357,12 +373,13 @@ def _build_indices(batch, max_relative_idx, max_relative_chain):
     rel_pos_bins = 2 * max_relative_idx + 2
     same_entity_offset = 2 * rel_pos_bins
     rel_pos_idx = relpos_idx(res_idx, same_chain, max_relative_idx)
-    rel_token_idx = relpos_idx(
-        batch["token_index"], same_chain & same_res, max_relative_idx
-    ) + rel_pos_bins
-    rel_chain_idx = relpos_idx(
-        batch["sym_id"], same_entity, max_relative_chain
-    ) + (same_entity_offset + 1)
+    rel_token_idx = (
+        relpos_idx(batch["token_index"], same_chain & same_res, max_relative_idx)
+        + rel_pos_bins
+    )
+    rel_chain_idx = relpos_idx(batch["sym_id"], same_entity, max_relative_chain) + (
+        same_entity_offset + 1
+    )
     return rel_pos_idx, rel_token_idx, rel_chain_idx, same_entity, same_entity_offset
 
 
@@ -390,10 +407,9 @@ def add_relpos_pair_embedding(
         batch, max_relative_idx, max_relative_chain
     )
     weight = linear_relpos.weight
-    w = weight.to(dtype=z.dtype).t().contiguous()
-    use_grad = torch.is_grad_enabled() and (
-        z.requires_grad or weight.requires_grad
-    )
+    z = z.contiguous()
+    w = weight.t().contiguous()
+    use_grad = torch.is_grad_enabled() and (z.requires_grad or weight.requires_grad)
 
     if use_grad:
         if _can_use_triton(z, w):
@@ -422,6 +438,9 @@ def add_relpos_pair_embedding(
             return z
         return fused_relpos_embed(z, w, idx1, idx2, idx3, same_entity, offset)
 
+    # Eager gather requires matching dtypes; mixed training downcasts here.
+    if w.dtype != z.dtype:
+        w = w.to(dtype=z.dtype)
     if inplace_safe:
         eager_relpos_embed_add_(z, w, idx1, idx2, idx3, same_entity, offset)
         return z
