@@ -13,11 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Error / speed / memory for fused SwiGLU vs eager.
-
-FP32 rows use IEEE eager as the baseline. The bf16-mixed row uses
-bf16 activations with fp32 masters (Triton does not take bf16 weights).
-"""
+"""Same-precision fused vs eager SwiGLU microbench (TF32 and bf16-mixed)."""
 
 from __future__ import annotations
 
@@ -29,6 +25,7 @@ from openfold3.entry_points.import_utils import _torch_gpu_setup
 _torch_gpu_setup()
 
 import torch  # noqa: E402
+from torch.utils.checkpoint import checkpoint  # noqa: E402
 
 from openfold3.core.kernels.triton.fused_swiglu_transition import (  # noqa: E402
     fused_swiglu_transition,
@@ -39,15 +36,18 @@ C = 128
 H = 512
 WARMUP = 5
 REPS = 20
+INFER_NS = (256, 384, 768)
+CKPT_NS = (384, 768)
+PRECISIONS = ("tf32", "bf16-mixed")
 
 
-def _weights(dtype=torch.float32):
+def _weights():
     torch.manual_seed(0)
-    g = torch.randn(C, device="cuda", dtype=dtype)
-    b = torch.randn(C, device="cuda", dtype=dtype)
-    wa = torch.randn(H, C, device="cuda", dtype=dtype) / C**0.5
-    wb = torch.randn(H, C, device="cuda", dtype=dtype) / C**0.5
-    wo = torch.randn(C, H, device="cuda", dtype=dtype) / H**0.5
+    g = torch.randn(C, device="cuda")
+    b = torch.randn(C, device="cuda")
+    wa = torch.randn(H, C, device="cuda") / C**0.5
+    wb = torch.randn(H, C, device="cuda") / C**0.5
+    wo = torch.randn(C, H, device="cuda") / H**0.5
     return g, b, wa, wb, wo
 
 
@@ -62,13 +62,11 @@ def _bind_module(g, b, wa, wb, wo):
     return module
 
 
-def _eager(module, x, mask):
-    return module._eager_transition(x, mask)
-
-
-def _set_tf32(enabled: bool) -> None:
-    torch.backends.cuda.matmul.allow_tf32 = enabled
-    torch.backends.cudnn.allow_tf32 = enabled
+def _set_precision(precision: str) -> torch.dtype:
+    tf32 = precision == "tf32"
+    torch.backends.cuda.matmul.allow_tf32 = tf32
+    torch.backends.cudnn.allow_tf32 = tf32
+    return torch.bfloat16 if precision == "bf16-mixed" else torch.float32
 
 
 def _time(fn):
@@ -83,312 +81,173 @@ def _time(fn):
 
 
 def _peak_U(fn, N):
-    U = N * N * C * 4
+    u = N * N * C * 4
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
     fn()
     torch.cuda.synchronize()
-    return (torch.cuda.max_memory_allocated() - base) / U
+    return (torch.cuda.max_memory_allocated() - base) / u
 
 
 def _err(a, b):
     d = (a.float() - b.float()).abs()
     abs_err = d.max().item()
-    rel_err = abs_err / (b.float().abs().max().item() + 1e-12)
-    return abs_err, rel_err
+    return abs_err, abs_err / (b.float().abs().max().item() + 1e-12)
 
 
-def _max_pair_err(pairs):
-    """Max abs and max per-tensor rel across ``(actual, ref)`` pairs."""
-    abs_err = 0.0
-    rel_err = 0.0
-    for a, b in pairs:
-        ae, re = _err(a, b)
-        abs_err = max(abs_err, ae)
-        rel_err = max(rel_err, re)
-    return abs_err, rel_err
-
-
-def bench_fwd(N: int) -> list[dict]:
+def bench_inference(N: int, precision: str) -> dict:
     os.environ["OPENFOLD3_FUSED_SWIGLU_TRANSITION"] = "1"
+    dtype = _set_precision(precision)
     g, b, wa, wb, wo = _weights()
     module = _bind_module(g, b, wa, wb, wo).eval()
-    x = torch.randn(1, N, N, C, device="cuda") * 0.5
-    mask = torch.ones(1, N, N, 1, device="cuda")
-
-    # Fixed baseline: default FP32 eager (IEEE).
-    _set_tf32(False)
+    x = torch.randn(1, N, N, C, device="cuda", dtype=dtype) * 0.5
+    mask = torch.ones(1, N, N, 1, device="cuda", dtype=dtype)
     with torch.inference_mode():
-        y_fp32 = _eager(module, x, mask)
-        baseline_ms = _time(lambda: _eager(module, x, mask))
-        baseline_U = _peak_U(lambda: _eager(module, x, mask), N)
-
-    rows = []
-    configs = [
-        ("fused FP32", False, True),
-        ("fused TF32", True, True),
-        ("eager TF32", True, False),
-    ]
-    for label, tf32, use_fused in configs:
-        _set_tf32(tf32)
-        with torch.inference_mode():
-            fn = (
-                (lambda: fused_swiglu_transition(x, g, b, wa, wb, wo, mask=mask))
-                if use_fused
-                else (lambda: _eager(module, x, mask))
-            )
-            y = fn()
-            abs_err, rel_err = _err(y, y_fp32)
-            ms = _time(fn)
-            peak_U = _peak_U(fn, N)
-            ip_ms = ip_U = None
-            if use_fused:
-                z = x.clone()
-                ip_ms = _time(
-                    lambda: fused_swiglu_transition(
-                        z, g, b, wa, wb, wo, mask=mask, residual=z
-                    )
-                )
-                z = x.clone()
-                ip_U = _peak_U(
-                    lambda: fused_swiglu_transition(
-                        z, g, b, wa, wb, wo, mask=mask, residual=z
-                    ),
-                    N,
-                )
-        rows.append(
-            {
-                "label": label,
-                "N": N,
-                "abs_err": abs_err,
-                "rel_err": rel_err,
-                "baseline_ms": baseline_ms,
-                "ms": ms,
-                "ip_ms": ip_ms,
-                "baseline_U": baseline_U,
-                "U": peak_U,
-                "ip_U": ip_U,
-            }
-        )
-    return rows
-
-
-def bench_bwd(N: int) -> list[dict]:
-    os.environ["OPENFOLD3_FUSED_SWIGLU_TRANSITION"] = "1"
-    g, b, wa, wb, wo = _weights()
-    module = _bind_module(g, b, wa, wb, wo).train()
-    x0 = torch.randn(1, N, N, C, device="cuda") * 0.5
-    mask = torch.ones(1, N, N, 1, device="cuda")
-    go = torch.randn_like(x0)
-
-    def run(fused: bool):
-        xd = x0.detach().requires_grad_(True)
-        if fused:
-            ts = [
-                xd,
-                g.detach().requires_grad_(True),
-                b.detach().requires_grad_(True),
-                wa.detach().requires_grad_(True),
-                wb.detach().requires_grad_(True),
-                wo.detach().requires_grad_(True),
-            ]
-            y = fused_swiglu_transition(*ts, mask=mask)
-            y.backward(go)
-            return [t.grad.detach().clone() for t in ts]
-        module.zero_grad(set_to_none=True)
-        y = _eager(module, xd, mask)
-        y.backward(go)
-        return [
-            xd.grad.detach().clone(),
-            module.layer_norm.weight.grad.detach().clone(),
-            module.layer_norm.bias.grad.detach().clone(),
-            module.swiglu.linear_a.weight.grad.detach().clone(),
-            module.swiglu.linear_b.weight.grad.detach().clone(),
-            module.linear_out.weight.grad.detach().clone(),
-        ]
-
-    _set_tf32(False)
-    g_fp32 = run(False)
-    baseline_ms = _time(lambda: run(False))
-    baseline_U = _peak_U(lambda: run(False), N)
-
-    rows = []
-    configs = [
-        ("fused FP32", False, True),
-        ("fused TF32", True, True),
-        ("eager TF32", True, False),
-    ]
-    for label, tf32, use_fused in configs:
-        _set_tf32(tf32)
-        grads = run(use_fused)
-        abs_errs = [(a - b).abs().max().item() for a, b in zip(g_fp32, grads)]
-        rel_errs = [
-            ae / (a.abs().max().item() + 1e-12) for ae, a in zip(abs_errs, g_fp32)
-        ]
-        ms = _time(lambda: run(use_fused))
-        peak_U = _peak_U(lambda: run(use_fused), N)
-        rows.append(
-            {
-                "label": label,
-                "N": N,
-                "abs_err": max(abs_errs),
-                "rel_err": max(rel_errs),
-                "baseline_ms": baseline_ms,
-                "ms": ms,
-                "baseline_U": baseline_U,
-                "U": peak_U,
-            }
-        )
-    return rows
-
-
-def _print_fwd(rows, title="FORWARD vs default FP32 eager (IEEE) baseline"):
-    print(title)
-    print(
-        f"{'path':>18} | {'N':>4} | {'abs_err':>9} | {'rel_err':>9} | "
-        f"{'base_U':>7} | {'path_U':>7} | {'ip_U':>5} | "
-        f"{'base':>7} | {'path':>7} | {'ip':>7} | {'base/p':>6}"
-    )
-    print("-" * 120)
-    for r in rows:
-        ip_U = f"{r['ip_U']:4.2f}U" if r["ip_U"] is not None else "  n/a"
-        ip_ms = f"{r['ip_ms']:6.2f}" if r["ip_ms"] is not None else "   n/a"
-        print(
-            f"{r['label']:>18} | {r['N']:>4} | {r['abs_err']:.2e} | "
-            f"{r['rel_err']:.2e} | {r['baseline_U']:6.2f}U | {r['U']:6.2f}U | "
-            f"{ip_U:>5} | {r['baseline_ms']:6.2f} | {r['ms']:6.2f} | "
-            f"{ip_ms:>7} | {r['baseline_ms']/r['ms']:5.2f}x"
-        )
-    print()
-
-
-def _print_bwd(rows, title="BACKWARD vs default FP32 eager (IEEE) baseline"):
-    print(title)
-    print(
-        f"{'path':>18} | {'N':>4} | {'abs_err':>9} | {'rel_err':>9} | "
-        f"{'base_U':>7} | {'path_U':>7} | {'base':>7} | {'path':>7} | {'base/p':>6}"
-    )
-    print("-" * 100)
-    for r in rows:
-        print(
-            f"{r['label']:>18} | {r['N']:>4} | {r['abs_err']:.2e} | "
-            f"{r['rel_err']:.2e} | {r['baseline_U']:6.2f}U | {r['U']:6.2f}U | "
-            f"{r['baseline_ms']:6.2f} | {r['ms']:6.2f} | "
-            f"{r['baseline_ms']/r['ms']:5.2f}x"
-        )
-    print()
-
-
-def bench_bwd_dtype(
-    N: int,
-    act_dtype: torch.dtype,
-    weight_dtype: torch.dtype,
-    label: str,
-):
-    """Training fwd+bwd for one activation/weight dtype pair. No TF32."""
-    os.environ["OPENFOLD3_FUSED_SWIGLU_TRANSITION"] = "1"
-    g, b, wa, wb, wo = _weights(weight_dtype)
-    module = _bind_module(g, b, wa, wb, wo).train()
-    x0 = torch.randn(1, N, N, C, device="cuda", dtype=act_dtype) * 0.5
-    mask = torch.ones(1, N, N, 1, device="cuda", dtype=act_dtype)
-    go = torch.randn_like(x0)
-    _set_tf32(False)
-
-    def run(fused: bool):
-        xd = x0.detach().requires_grad_(True)
-        if fused:
-            ts = [
-                xd,
-                g.detach().requires_grad_(True),
-                b.detach().requires_grad_(True),
-                wa.detach().requires_grad_(True),
-                wb.detach().requires_grad_(True),
-                wo.detach().requires_grad_(True),
-            ]
-            y = fused_swiglu_transition(*ts, mask=mask)
-            y.backward(go)
-            return y.detach(), [t.grad.detach().clone() for t in ts]
-        module.zero_grad(set_to_none=True)
-        y = _eager(module, xd, mask)
-        y.backward(go)
-        return y.detach(), [
-            xd.grad.detach().clone(),
-            module.layer_norm.weight.grad.detach().clone(),
-            module.layer_norm.bias.grad.detach().clone(),
-            module.swiglu.linear_a.weight.grad.detach().clone(),
-            module.swiglu.linear_b.weight.grad.detach().clone(),
-            module.linear_out.weight.grad.detach().clone(),
-        ]
-
-    y_e, g_e = run(False)
-    y_f, g_f = run(True)
-    abs_err, rel_err = _max_pair_err([(y_f, y_e), *zip(g_f, g_e)])
-    return {
-        "label": label,
-        "N": N,
-        "abs_err": abs_err,
-        "rel_err": rel_err,
-        "baseline_ms": _time(lambda: run(False)),
-        "ms": _time(lambda: run(True)),
-        "baseline_U": _peak_U(lambda: run(False), N),
-        "U": _peak_U(lambda: run(True), N),
-    }
-
-
-def bench_fwd_dtype(N: int, weight_dtype: torch.dtype, label: str) -> dict:
-    os.environ["OPENFOLD3_FUSED_SWIGLU_TRANSITION"] = "1"
-    g, b, wa, wb, wo = _weights(weight_dtype)
-    module = _bind_module(g, b, wa, wb, wo).eval()
-    x = torch.randn(1, N, N, C, device="cuda", dtype=torch.bfloat16) * 0.5
-    mask = torch.ones(1, N, N, 1, device="cuda", dtype=torch.bfloat16)
-    _set_tf32(False)
-    with torch.inference_mode():
-        y_e = _eager(module, x, mask)
+        y_e = module._eager_transition(x, mask)
         y_f = fused_swiglu_transition(x, g, b, wa, wb, wo, mask=mask)
         abs_err, rel_err = _err(y_f, y_e)
         z = x.clone()
         return {
-            "label": label,
+            "precision": precision,
             "N": N,
             "abs_err": abs_err,
             "rel_err": rel_err,
-            "baseline_ms": _time(lambda: _eager(module, x, mask)),
-            "ms": _time(
+            "eager_ms": _time(lambda: module._eager_transition(x, mask)),
+            "fused_ms": _time(
                 lambda: fused_swiglu_transition(x, g, b, wa, wb, wo, mask=mask)
             ),
             "ip_ms": _time(
-                lambda: fused_swiglu_transition(z, g, b, wa, wb, wo, mask=mask, residual=z)
+                lambda z=z: fused_swiglu_transition(
+                    z, g, b, wa, wb, wo, mask=mask, residual=z
+                )
             ),
-            "baseline_U": _peak_U(lambda: _eager(module, x, mask), N),
-            "U": _peak_U(
+            "eager_U": _peak_U(lambda: module._eager_transition(x, mask), N),
+            "fused_U": _peak_U(
                 lambda: fused_swiglu_transition(x, g, b, wa, wb, wo, mask=mask), N
             ),
             "ip_U": _peak_U(
-                lambda: fused_swiglu_transition(z, g, b, wa, wb, wo, mask=mask, residual=z),
+                lambda z=z: fused_swiglu_transition(
+                    z, g, b, wa, wb, wo, mask=mask, residual=z
+                ),
                 N,
             ),
         }
 
 
-def main():
-    lengths = [128, 256, 384, 768]
-    fwd, bwd, fwd16, bwd16 = [], [], [], []
-    for N in lengths:
-        print(f"running fwd N={N}...", flush=True)
-        fwd.extend(bench_fwd(N))
-        print(f"running bwd N={N}...", flush=True)
-        bwd.extend(bench_bwd(N))
-        print(f"running mixed N={N}...", flush=True)
-        fwd16.append(bench_fwd_dtype(N, torch.float32, "fused bf16-mixed"))
-        bwd16.append(
-            bench_bwd_dtype(N, torch.bfloat16, torch.float32, "fused bf16-mixed")
+def bench_checkpointed(N: int, precision: str, fused: bool) -> dict:
+    os.environ["OPENFOLD3_FUSED_SWIGLU_TRANSITION"] = "1"
+    dtype = _set_precision(precision)
+    g, b, wa, wb, wo = _weights()
+    module = _bind_module(g, b, wa, wb, wo).train()
+    x0 = torch.randn(1, N, N, C, device="cuda", dtype=dtype) * 0.5
+    mask = torch.ones(1, N, N, 1, device="cuda", dtype=dtype)
+    grad_out = torch.randn_like(x0)
+    u = N * N * C * 4
+
+    def forward_graph():
+        x = x0.detach().requires_grad_(True)
+        if not fused:
+            module.zero_grad(set_to_none=True)
+            return checkpoint(
+                lambda value: module._eager_transition(value, mask),
+                x,
+                use_reentrant=False,
+            )
+        leaves = [
+            x,
+            g.detach().requires_grad_(True),
+            b.detach().requires_grad_(True),
+            wa.detach().requires_grad_(True),
+            wb.detach().requires_grad_(True),
+            wo.detach().requires_grad_(True),
+        ]
+        return checkpoint(
+            lambda *args: fused_swiglu_transition(*args, mask=mask),
+            *leaves,
+            use_reentrant=False,
         )
-    _print_fwd(fwd)
-    _print_bwd(bwd)
-    _print_fwd(fwd16, "BF16-MIXED FORWARD (vs eager mixed)")
-    _print_bwd(bwd16, "BF16-MIXED BACKWARD (vs eager mixed)")
+
+    def full_step():
+        forward_graph().backward(grad_out)
+
+    def peak_U():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        full_step()
+        torch.cuda.synchronize()
+        return (torch.cuda.max_memory_allocated() - base) / u
+
+    fwd_ms = _time(forward_graph)
+    full_ms = _time(full_step)
+    return {
+        "precision": precision,
+        "path": "fused" if fused else "eager",
+        "N": N,
+        "peak_U": peak_U(),
+        "fwd_ms": fwd_ms,
+        "bwd_ms": full_ms - fwd_ms,
+        "full_ms": full_ms,
+    }
+
+
+def _print_inference(rows):
+    print("INFERENCE (same-precision fused vs eager)")
+    print(
+        f"{'prec':>11} | {'N':>4} | {'abs_err':>9} | {'rel_err':>9} | "
+        f"{'eager_U':>8} | {'fused_U':>8} | {'ip_U':>5} | "
+        f"{'eager':>7} | {'fused':>7} | {'ip':>7} | {'e/f':>6}"
+    )
+    print("-" * 112)
+    for r in rows:
+        print(
+            f"{r['precision']:>11} | {r['N']:>4} | {r['abs_err']:.2e} | "
+            f"{r['rel_err']:.2e} | {r['eager_U']:7.2f}U | {r['fused_U']:7.2f}U | "
+            f"{r['ip_U']:4.2f}U | {r['eager_ms']:6.2f} | {r['fused_ms']:6.2f} | "
+            f"{r['ip_ms']:6.2f} | {r['eager_ms'] / r['fused_ms']:5.2f}x"
+        )
+    print()
+
+
+def _print_checkpointed(rows):
+    print("CHECKPOINTED TRAINING (non-reentrant, one block, same precision)")
+    print(
+        f"{'prec':>11} | {'path':>6} | {'N':>4} | {'peak':>7} | "
+        f"{'fwd':>7} | {'bwd':>7} | {'full':>7} | {'vs eager':>8}"
+    )
+    print("-" * 80)
+    eager_ms = {
+        (r["precision"], r["N"]): r["full_ms"] for r in rows if r["path"] == "eager"
+    }
+    for row in rows:
+        ratio = row["full_ms"] / eager_ms[(row["precision"], row["N"])]
+        print(
+            f"{row['precision']:>11} | {row['path']:>6} | {row['N']:4d} | "
+            f"{row['peak_U']:6.2f}U | {row['fwd_ms']:6.2f} | "
+            f"{row['bwd_ms']:6.2f} | {row['full_ms']:6.2f} | {ratio:7.2f}x"
+        )
+    print()
+
+
+def main():
+    infer = []
+    for N in INFER_NS:
+        for precision in PRECISIONS:
+            print(f"running inference {precision} N={N}...", flush=True)
+            infer.append(bench_inference(N, precision))
+    _print_inference(infer)
+
+    ckpt = []
+    for N in CKPT_NS:
+        for precision in PRECISIONS:
+            for fused in (False, True):
+                label = "fused" if fused else "eager"
+                print(f"running checkpointed {precision} {label} N={N}...", flush=True)
+                ckpt.append(bench_checkpointed(N, precision, fused))
+    _print_checkpointed(ckpt)
 
 
 if __name__ == "__main__":
