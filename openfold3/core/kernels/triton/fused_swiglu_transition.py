@@ -22,23 +22,25 @@ Fuses
     x -> LayerNorm -> SwiGLU(SiLU(linear_a(x)) * linear_b(x)) -> linear_out
       -> * mask  [-> + residual]
 
-GEMMs honor ``torch.backends.cuda.matmul.allow_tf32`` for fp32 activations:
+One ``GEMM_MODE`` selects the ``tl.dot`` policy for launch, autotune, and
+the kernel:
 
-- TF32 on: ``input_precision="tf32"`` with round-nearest ``f32->tf32``
+- ``bf16``: bf16 activations, fp32 accumulate. Weight tiles are downcast
+  inside the GEMM only.
+- ``tf32``: fp32 activations with round-nearest ``f32->tf32``
   (``cvt.rna.tf32.f32``), matching cuBLAS TF32. Triton's default TF32
   *truncates*, which was the source of the extra ~2e-2 abs error.
-- TF32 off: ``input_precision="ieee"`` (true FP32).
+- ``ieee``: true FP32 when ``torch.backends.cuda.matmul.allow_tf32`` is off.
 
 Triton requires fp32 Parameter masters (same as fused template
-projection). Activations may be fp32 or bf16. bf16 activations use
-``tl.dot`` in bf16 with fp32 accumulate; weight tiles are downcast
-inside the GEMM only. Pure bf16 weights are ineligible.
+projection). Pure bf16 weights are ineligible.
 
 Inference (in-place) never materializes the ``[M, hidden]`` expansion.
-Training (out-of-place) writes ``x_hat``, ``a``, and ``b`` so backward can
-skip LayerNorm and the up-projections. Weight grads use exclusive split-M
-tiles (no atomics). Sequence length ``M`` is not an autotune / specialize
-key. Ineligible shapes use ``SwiGLUTransition`` primitives.
+Training (out-of-place) writes ``x_hat``, ``a``, ``b``, ``mean``, and
+``rstd`` so backward can skip LayerNorm and the up-projections. Weight
+grads use exclusive split-M tiles (no atomics). Sequence length ``M`` is
+not an autotune / specialize key. Ineligible shapes use
+``SwiGLUTransition`` primitives.
 """
 
 from __future__ import annotations
@@ -152,30 +154,26 @@ if _TRITON_AVAILABLE:
     def _dw_autotune_configs():
         # dW keeps three weight accumulators live; keep tiles inside SMEM.
         configs = []
-        for block_m, block_h, num_warps in (
-            (16, 32, 4),
-            (16, 64, 4),
-            (32, 32, 4),
-            (32, 64, 4),
-            (64, 32, 4),
-            (64, 32, 8),
+        for block_m, block_h, num_warps, num_stages in (
+            (16, 32, 4, 1),
+            (16, 64, 4, 2),
+            (32, 32, 4, 2),
+            (32, 64, 4, 2),
+            (64, 32, 4, 2),
+            (64, 32, 8, 2),
+            (64, 64, 8, 2),
         ):
             configs.append(
                 triton.Config(
                     {"BLOCK_M": block_m, "BLOCK_H": block_h},
                     num_warps=num_warps,
-                    num_stages=1,
+                    num_stages=num_stages,
                 )
             )
         return configs
 
     def _prune_by_precision(configs, named_args, **kwargs):
-        precision = kwargs.get("INPUT_PRECISION", named_args.get("INPUT_PRECISION"))
-        act = named_args.get("X_ptr")
-        if act is None:
-            act = named_args.get("A_ptr")
-        if act is None:
-            act = named_args.get("XHAT_ptr")
+        mode = kwargs.get("GEMM_MODE", named_args.get("GEMM_MODE"))
         H = kwargs.get("H", named_args.get("H"))
         kept = []
         for cfg in configs:
@@ -183,11 +181,7 @@ if _TRITON_AVAILABLE:
             block_h = cfg.kwargs["BLOCK_H"]
             if H is not None and block_h > int(H):
                 continue
-            if (
-                precision == "ieee"
-                and getattr(act, "dtype", None) != torch.bfloat16
-                and block_m >= 64
-            ):
+            if mode == "ieee" and block_m >= 64:
                 continue
             kept.append(cfg)
         return kept if kept else configs[:1]
@@ -204,26 +198,27 @@ if _TRITON_AVAILABLE:
         )
 
     @triton.jit
-    def _dot_f32(a, b, INPUT_PRECISION: tl.constexpr, ROUND_TF32: tl.constexpr, act_ptr):
-        # act_ptr is the activation allocation (X / a / x_hat). Its storage
-        # dtype is the input; tl.dot input_precision is only ieee/tf32.
-        if act_ptr.dtype.element_ty == tl.bfloat16:
+    def _dot_f32(a, b, GEMM_MODE: tl.constexpr):
+        if GEMM_MODE == "bf16":
             return tl.dot(
                 a.to(tl.bfloat16),
                 b.to(tl.bfloat16),
                 input_precision="ieee",
                 out_dtype=tl.float32,
             )
-        if ROUND_TF32:
+        a = a.to(tl.float32)
+        b = b.to(tl.float32)
+        if GEMM_MODE == "tf32":
             a = _round_to_tf32(a)
             b = _round_to_tf32(b)
-        return tl.dot(a, b, input_precision=INPUT_PRECISION, out_dtype=tl.float32)
+            return tl.dot(a, b, input_precision="tf32", out_dtype=tl.float32)
+        return tl.dot(a, b, input_precision="ieee", out_dtype=tl.float32)
 
     @triton.autotune(
         configs=_fwd_autotune_configs(),
-        key=["INPUT_PRECISION", "K", "H", "C_OUT", "SAVE_ACTS"],
+        key=["GEMM_MODE", "K", "H", "C_OUT"],
         prune_configs_by={"early_config_prune": _prune_by_precision},
-        restore_value=["Y_ptr", "A_ptr", "B_ptr"],
+        restore_value=["Y_ptr", "A_ptr", "B_ptr", "Mean_ptr", "Rstd_ptr"],
     )
     @triton.jit(
         do_not_specialize=[
@@ -256,8 +251,11 @@ if _TRITON_AVAILABLE:
             "Mask_ptr",
             "Res_ptr",
             "Y_ptr",
+            "XHAT_ptr",
             "A_ptr",
             "B_ptr",
+            "Mean_ptr",
+            "Rstd_ptr",
         ],
     )
     def _fused_swiglu_transition_fwd_kernel(
@@ -273,6 +271,8 @@ if _TRITON_AVAILABLE:
         XHAT_ptr,
         A_ptr,
         B_ptr,
+        Mean_ptr,
+        Rstd_ptr,
         stride_x_m,
         stride_x_k,
         stride_wa_h,
@@ -298,8 +298,7 @@ if _TRITON_AVAILABLE:
         HAS_MASK: tl.constexpr,
         HAS_RESIDUAL: tl.constexpr,
         SAVE_ACTS: tl.constexpr,
-        INPUT_PRECISION: tl.constexpr,
-        ROUND_TF32: tl.constexpr,
+        GEMM_MODE: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_H: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -339,6 +338,8 @@ if _TRITON_AVAILABLE:
                 x_hat.to(XHAT_ptr.dtype.element_ty),
                 mask=m_mask[:, None] & k_mask[None, :],
             )
+            tl.store(Mean_ptr + offs_m, mean, mask=m_mask)
+            tl.store(Rstd_ptr + offs_m, rstd, mask=m_mask)
 
         acc_out = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for h0 in range(0, H, BLOCK_H):
@@ -351,7 +352,7 @@ if _TRITON_AVAILABLE:
             wa = tl.load(wa_ptrs, mask=h_mask[:, None] & k_mask[None, :], other=0.0).to(
                 tl.float32
             )
-            acc_a = _dot_f32(x_hat, tl.trans(wa), INPUT_PRECISION, ROUND_TF32, X_ptr)
+            acc_a = _dot_f32(x_hat, tl.trans(wa), GEMM_MODE)
 
             wb_ptrs = (
                 WB_ptr + offs_h[:, None] * stride_wb_h + offs_k[None, :] * stride_wb_k
@@ -359,7 +360,7 @@ if _TRITON_AVAILABLE:
             wb = tl.load(wb_ptrs, mask=h_mask[:, None] & k_mask[None, :], other=0.0).to(
                 tl.float32
             )
-            acc_b = _dot_f32(x_hat, tl.trans(wb), INPUT_PRECISION, ROUND_TF32, X_ptr)
+            acc_b = _dot_f32(x_hat, tl.trans(wb), GEMM_MODE)
 
             if SAVE_ACTS:
                 a_ptrs = A_ptr + offs_m_64[:, None] * stride_a_m + offs_h[None, :]
@@ -382,7 +383,7 @@ if _TRITON_AVAILABLE:
             wo = tl.load(wo_ptrs, mask=n_mask[:, None] & h_mask[None, :], other=0.0).to(
                 tl.float32
             )
-            acc_out += _dot_f32(silu, tl.trans(wo), INPUT_PRECISION, ROUND_TF32, X_ptr)
+            acc_out += _dot_f32(silu, tl.trans(wo), GEMM_MODE)
 
         if HAS_MASK:
             mask_val = tl.load(
@@ -410,7 +411,7 @@ if _TRITON_AVAILABLE:
 
     @triton.autotune(
         configs=_dx_autotune_configs(),
-        key=["INPUT_PRECISION", "K", "H", "C_OUT"],
+        key=["GEMM_MODE", "K", "H", "C_OUT"],
         prune_configs_by={"early_config_prune": _prune_by_precision},
         restore_value=["GX_ptr"],
     )
@@ -453,8 +454,7 @@ if _TRITON_AVAILABLE:
         H: tl.constexpr,
         C_OUT: tl.constexpr,
         HAS_MASK: tl.constexpr,
-        INPUT_PRECISION: tl.constexpr,
-        ROUND_TF32: tl.constexpr,
+        GEMM_MODE: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_H: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -471,14 +471,12 @@ if _TRITON_AVAILABLE:
         n_mask = offs_n < C_OUT
 
         go_ptrs = GO_ptr + offs_m_64[:, None] * stride_go_m + offs_n[None, :]
-        go = tl.load(go_ptrs, mask=m_mask[:, None] & n_mask[None, :], other=0.0).to(
-            tl.float32
-        )
+        go = tl.load(go_ptrs, mask=m_mask[:, None] & n_mask[None, :], other=0.0)
         if HAS_MASK:
             mask_val = tl.load(
                 Mask_ptr + offs_m * stride_mask_m, mask=m_mask, other=0.0
             ).to(tl.float32)
-            go = go * mask_val[:, None]
+            go = go.to(tl.float32) * mask_val[:, None]
 
         grad_x_hat = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
         for h0 in range(0, H, BLOCK_H):
@@ -498,25 +496,25 @@ if _TRITON_AVAILABLE:
                 WA_ptr + offs_h[:, None] * K + offs_k[None, :],
                 mask=h_mask[:, None] & k_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+            )
             wb = tl.load(
                 WB_ptr + offs_h[:, None] * K + offs_k[None, :],
                 mask=h_mask[:, None] & k_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+            )
             wo = tl.load(
                 WOUT_ptr + offs_n[:, None] * H + offs_h[None, :],
                 mask=n_mask[:, None] & h_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+            )
 
-            grad_h = _dot_f32(go, wo, INPUT_PRECISION, ROUND_TF32, A_ptr)
+            grad_h = _dot_f32(go, wo, GEMM_MODE)
             sig = tl.sigmoid(a)
             silu_a = a * sig
             grad_a = grad_h * b * (sig + silu_a * (1.0 - sig))
             grad_b = grad_h * silu_a
-            grad_x_hat += _dot_f32(grad_a, wa, INPUT_PRECISION, ROUND_TF32, A_ptr)
-            grad_x_hat += _dot_f32(grad_b, wb, INPUT_PRECISION, ROUND_TF32, A_ptr)
+            grad_x_hat += _dot_f32(grad_a, wa, GEMM_MODE)
+            grad_x_hat += _dot_f32(grad_b, wb, GEMM_MODE)
 
         gx_ptrs = GX_ptr + offs_m_64[:, None] * stride_gx_m + offs_k[None, :]
         tl.store(
@@ -527,7 +525,7 @@ if _TRITON_AVAILABLE:
 
     @triton.autotune(
         configs=_dw_autotune_configs(),
-        key=["INPUT_PRECISION", "K", "H", "C_OUT"],
+        key=["GEMM_MODE", "K", "H", "C_OUT"],
         prune_configs_by={"early_config_prune": _prune_by_precision},
         restore_value=["PWA_ptr", "PWB_ptr", "PWO_ptr"],
     )
@@ -572,8 +570,7 @@ if _TRITON_AVAILABLE:
         H: tl.constexpr,
         C_OUT: tl.constexpr,
         HAS_MASK: tl.constexpr,
-        INPUT_PRECISION: tl.constexpr,
-        ROUND_TF32: tl.constexpr,
+        GEMM_MODE: tl.constexpr,
         SPLIT_M: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_H: tl.constexpr,
@@ -598,7 +595,7 @@ if _TRITON_AVAILABLE:
             WOUT_ptr + offs_n[:, None] * H + offs_h[None, :],
             mask=n_mask[:, None] & h_mask[None, :],
             other=0.0,
-        ).to(tl.float32)
+        )
 
         acc_dwa = tl.zeros((BLOCK_H, BLOCK_K), dtype=tl.float32)
         acc_dwb = tl.zeros((BLOCK_H, BLOCK_K), dtype=tl.float32)
@@ -609,21 +606,22 @@ if _TRITON_AVAILABLE:
             offs_m_64 = offs_m.to(tl.int64)
             m_mask = offs_m < split_end
 
+            # x_hat / go only feed MMA; keep storage dtype on the bf16 path.
             x_hat = tl.load(
                 XHAT_ptr + offs_m_64[:, None] * stride_xhat_m + offs_k[None, :],
                 mask=m_mask[:, None] & k_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+            )
             go = tl.load(
                 GO_ptr + offs_m_64[:, None] * stride_go_m + offs_n[None, :],
                 mask=m_mask[:, None] & n_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+            )
             if HAS_MASK:
                 mask_val = tl.load(
                     Mask_ptr + offs_m * stride_mask_m, mask=m_mask, other=0.0
                 ).to(tl.float32)
-                go = go * mask_val[:, None]
+                go = go.to(tl.float32) * mask_val[:, None]
             a = tl.load(
                 A_ptr + offs_m_64[:, None] * stride_a_m + offs_h[None, :],
                 mask=m_mask[:, None] & h_mask[None, :],
@@ -638,12 +636,12 @@ if _TRITON_AVAILABLE:
             sig = tl.sigmoid(a)
             silu_a = a * sig
             h = silu_a * b
-            grad_h = _dot_f32(go, wo, INPUT_PRECISION, ROUND_TF32, A_ptr)
-            acc_dwo += _dot_f32(tl.trans(go), h, INPUT_PRECISION, ROUND_TF32, A_ptr)
+            grad_h = _dot_f32(go, wo, GEMM_MODE)
+            acc_dwo += _dot_f32(tl.trans(go), h, GEMM_MODE)
             grad_a = grad_h * b * (sig + silu_a * (1.0 - sig))
             grad_b = grad_h * silu_a
-            acc_dwa += _dot_f32(tl.trans(grad_a), x_hat, INPUT_PRECISION, ROUND_TF32, A_ptr)
-            acc_dwb += _dot_f32(tl.trans(grad_b), x_hat, INPUT_PRECISION, ROUND_TF32, A_ptr)
+            acc_dwa += _dot_f32(tl.trans(grad_a), x_hat, GEMM_MODE)
+            acc_dwb += _dot_f32(tl.trans(grad_b), x_hat, GEMM_MODE)
 
         pwa_ptrs = PWA_ptr + split * H * K + offs_h[:, None] * K + offs_k[None, :]
         pwb_ptrs = PWB_ptr + split * H * K + offs_h[:, None] * K + offs_k[None, :]
@@ -664,11 +662,13 @@ else:  # pragma: no cover
         raise RuntimeError("Triton is required for fused_swiglu_transition")
 
 
-def _matmul_precision_args(act: torch.Tensor) -> tuple[str, bool]:
-    """``tl.dot`` input_precision from the TF32 context. bf16 inputs ignore it."""
-    if act.dtype == torch.bfloat16 or not torch.backends.cuda.matmul.allow_tf32:
-        return "ieee", False
-    return "tf32", True
+def _gemm_mode(act: torch.Tensor) -> str:
+    """One GEMM policy for launch, autotune, and ``tl.dot``."""
+    if act.dtype == torch.bfloat16:
+        return "bf16"
+    if torch.backends.cuda.matmul.allow_tf32:
+        return "tf32"
+    return "ieee"
 
 
 def _next_power_of_two(n: int) -> int:
@@ -693,7 +693,7 @@ def _launch_fused_swiglu_transition(
 
     Inference (``save_acts=False``) may write in place when ``residual`` aliases
     ``x``. Training (``save_acts=True``) writes a fresh ``y`` plus ``x_hat``,
-    ``a``, ``b`` for the backward kernels.
+    ``a``, ``b``, ``mean``, and ``rstd`` for the backward kernels.
     """
     M, K = x_2d.shape
     H = w_a.shape[0]
@@ -708,12 +708,15 @@ def _launch_fused_swiglu_transition(
         x_hat = torch.empty((M, K), dtype=x_2d.dtype, device=x_2d.device)
         a = torch.empty((M, H), dtype=x_2d.dtype, device=x_2d.device)
         b = torch.empty((M, H), dtype=x_2d.dtype, device=x_2d.device)
+        mean = torch.empty((M,), dtype=torch.float32, device=x_2d.device)
+        rstd = torch.empty((M,), dtype=torch.float32, device=x_2d.device)
     else:
         x_hat = a = b = y
+        mean = rstd = y
 
     BLOCK_K = max(_next_power_of_two(K), 16)
     BLOCK_N = max(_next_power_of_two(C_OUT), 16)
-    input_precision, round_tf32 = _matmul_precision_args(x_2d)
+    gemm_mode = _gemm_mode(x_2d)
 
     beta_ptr = beta if beta is not None else x_2d
     mask_ptr = mask_1d if mask_1d is not None else x_2d
@@ -736,6 +739,8 @@ def _launch_fused_swiglu_transition(
         x_hat,
         a,
         b,
+        mean,
+        rstd,
         x_2d.stride(0),
         x_2d.stride(1),
         w_a.stride(0),
@@ -761,13 +766,12 @@ def _launch_fused_swiglu_transition(
         HAS_MASK=mask_1d is not None,
         HAS_RESIDUAL=residual_2d is not None,
         SAVE_ACTS=save_acts,
-        INPUT_PRECISION=input_precision,
-        ROUND_TF32=round_tf32,
+        GEMM_MODE=gemm_mode,
         BLOCK_K=BLOCK_K,
         BLOCK_N=BLOCK_N,
     )
     if save_acts:
-        return y, x_hat, a, b
+        return y, x_hat, a, b, mean, rstd
     return y
 
 
@@ -791,7 +795,7 @@ def fused_swiglu_transition_weight_grad(
     M, K = x_hat.shape
     H = a.shape[1]
     C_OUT = w_out.shape[0]
-    input_precision, round_tf32 = _matmul_precision_args(a)
+    gemm_mode = _gemm_mode(a)
     BLOCK_K = max(_next_power_of_two(K), 16)
     BLOCK_N = max(_next_power_of_two(C_OUT), 16)
 
@@ -806,13 +810,13 @@ def fused_swiglu_transition_weight_grad(
     grad_wa = grad_wb = grad_wo = None
     if compute_dw:
         x_hat_c = x_hat.contiguous()
-        partial_wa = torch.zeros(
+        partial_wa = torch.empty(
             _BWD_SPLIT_M, H, K, device=x_hat.device, dtype=torch.float32
         )
-        partial_wb = torch.zeros(
+        partial_wb = torch.empty(
             _BWD_SPLIT_M, H, K, device=x_hat.device, dtype=torch.float32
         )
-        partial_wo = torch.zeros(
+        partial_wo = torch.empty(
             _BWD_SPLIT_M, C_OUT, H, device=x_hat.device, dtype=torch.float32
         )
 
@@ -839,8 +843,7 @@ def fused_swiglu_transition_weight_grad(
             H,
             C_OUT,
             HAS_MASK=has_mask,
-            INPUT_PRECISION=input_precision,
-            ROUND_TF32=round_tf32,
+            GEMM_MODE=gemm_mode,
             SPLIT_M=_BWD_SPLIT_M,
             BLOCK_K=BLOCK_K,
             BLOCK_N=BLOCK_N,
@@ -848,11 +851,9 @@ def fused_swiglu_transition_weight_grad(
         grad_wa = partial_wa.sum(dim=0)
         grad_wb = partial_wb.sum(dim=0)
         grad_wo = partial_wo.sum(dim=0)
-        del partial_wa, partial_wb, partial_wo
 
     grad_x_hat = None
     if compute_dx:
-        # fp32 x_hat is dead after dW; reuse it for d(x_hat) instead of +1U.
         if x_hat.dtype == torch.float32:
             grad_x_hat = x_hat
         else:
@@ -882,8 +883,7 @@ def fused_swiglu_transition_weight_grad(
             H,
             C_OUT,
             HAS_MASK=has_mask,
-            INPUT_PRECISION=input_precision,
-            ROUND_TF32=round_tf32,
+            GEMM_MODE=gemm_mode,
             BLOCK_K=BLOCK_K,
             BLOCK_N=BLOCK_N,
         )
@@ -902,7 +902,7 @@ class _FusedSwiGLUTransitionFn(torch.autograd.Function):
         c_in = gamma.shape[0]
         x_2d = x.contiguous().view(-1, c_in)
         mask_1d = mask.reshape(-1).contiguous() if has_mask else None
-        y_2d, x_hat, a, b = _launch_fused_swiglu_transition(
+        y_2d, x_hat, a, b, mean, rstd = _launch_fused_swiglu_transition(
             x_2d,
             gamma,
             beta if has_beta else None,
@@ -916,8 +916,9 @@ class _FusedSwiGLUTransitionFn(torch.autograd.Function):
         )
         y = y_2d.view_as(x)
 
-        ctx.save_for_backward(x, x_hat, a, b, gamma, beta_t, w_a, w_b, w_out, mask_t)
-        ctx.eps = float(eps)
+        ctx.save_for_backward(
+            x, x_hat, a, b, mean, rstd, gamma, beta_t, w_a, w_b, w_out, mask_t
+        )
         ctx.has_beta = has_beta
         ctx.has_mask = has_mask
         ctx.x_shape = x.shape
@@ -926,10 +927,11 @@ class _FusedSwiGLUTransitionFn(torch.autograd.Function):
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_out):
-        x, x_hat, a, b, gamma, beta_t, w_a, w_b, w_out, mask_t = ctx.saved_tensors
+        x, x_hat, a, b, mean, rstd, gamma, beta_t, w_a, w_b, w_out, mask_t = (
+            ctx.saved_tensors
+        )
         beta = beta_t if ctx.has_beta else None
         mask = mask_t if ctx.has_mask else None
-        eps = ctx.eps
         c_in = gamma.shape[0]
 
         go_2d = grad_out.contiguous().view(-1, grad_out.shape[-1])
@@ -953,10 +955,7 @@ class _FusedSwiGLUTransitionFn(torch.autograd.Function):
         grad_x = grad_gamma = grad_beta = None
         if need_dx:
             x_2d = x.contiguous().view(-1, c_in)
-            x_f = x_2d.float()
-            mean = x_f.mean(dim=-1)
-            var = x_f.var(dim=-1, unbiased=False)
-            rstd = torch.rsqrt(var + eps)
+            x_f = x_2d.float() if x_2d.dtype != torch.float32 else x_2d
             ln_weight = gamma.float()
             ln_bias = beta.float() if beta is not None else None
             grad_input, grad_gamma, grad_beta = torch.ops.aten.native_layer_norm_backward(
@@ -1012,8 +1011,8 @@ def fused_swiglu_transition(
     Triton only. The model uses ``SwiGLUTransition`` primitives when this
     launch is ineligible. Inference may write in place when ``residual is
     x``. Training is always out-of-place and saves activations for the
-    Triton backward. Triton keeps fp32 masters; bf16 activations use bf16
-    GEMMs.
+    Triton backward. ``GEMM_MODE`` is ``bf16``, ``tf32``, or ``ieee``;
+    masters stay fp32.
     """
     if not is_fused_swiglu_transition_eligible(x, gamma, beta, w_a, w_b, w_out):
         raise RuntimeError(
