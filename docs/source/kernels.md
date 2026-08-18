@@ -61,3 +61,49 @@ OPENFOLD3_FUSED_TEMPLATE_COORD=0
 ```
 
 TF32 for the Triton backward GEMM follows `torch.backends.cuda.matmul.allow_tf32`. Distogram settings must remain the defaults (`min_bin=3.25`, `max_bin=50.75`, `n_bins=39`).
+
+# Fused input relative-position embedding
+
+The input embedder can add relative-position pair features from compact index tables instead of materializing an N² one-hot `relpos_complex` tensor and running `linear_relpos` over it. When `linear_relpos` is bias-free (the default all-atom preset), OpenFold3 uses this weight-table path automatically for both inference and training.
+
+Under inference / no-grad, the gather-add may update the pair tensor in place, and bias-free token-bonds are folded in with `addmm_` so a pair-sized linear output is not allocated. Under training, an autograd wrapper keeps a length-generic Triton split-K weight backward (deterministic per-split accumulate, fp32 reduction) and falls back to a differentiable eager gather-add when Triton is ineligible (for example CPU or non-contiguous inputs).
+
+## Triton kernel
+
+On CUDA with contiguous pair / weight tensors and activation dtype `float32` or `bfloat16`, the fused gather-add uses a length-generic Triton kernel (sequence length is only the launch grid, so one compile serves all N). Sequence-length specialization is intentionally avoided.
+
+IEEE fp32 and TF32 share the same gather-add: there is no `tl.dot`, so `torch.backends.cuda.matmul.allow_tf32` does not change the math. bf16-mixed keeps fp32 Parameter masters; weight tiles are upcast on load, the add and `dW` accumulate in fp32, and pair activations stay bf16. Matching bf16 weights remain eligible. The eager fallback downcasts the table when the pair and weight dtypes do not match.
+
+```bash
+# Default: use Triton when eligible
+OPENFOLD3_FUSED_RELPOS=1
+
+# Force the eager weight-table path
+OPENFOLD3_FUSED_RELPOS=0
+```
+
+If `linear_relpos` has a bias, the classic `relpos_complex` + `Linear` path is retained.
+
+# Fused pair SwiGLU transition
+
+Pair `SwiGLUTransition` (LN → SwiGLU → Linear, optional mask and residual) can run as one length-generic Triton kernel instead of the module primitives. The dispatcher is `SwiGLUTransition`; ineligible shapes keep the eager path.
+
+Under inference / no-grad, the kernel may write `residual + transition(x)` in place when `residual` is `x`. Under training, an autograd wrapper saves `x_hat` / `mean` / `rstd` and rematerializes the SwiGLU hidden activations; `dW` uses exclusive split-M tiles (deterministic, no atomics) and accumulates in fp32.
+
+## Triton kernel
+
+On CUDA with a contiguous activation, `float32` or `bfloat16` activations, fp32 Parameter masters, `c_in ≤ 256`, hidden width `≤ 512`, and at least 4096 rows, the fused path uses one `GEMM_MODE` for every `tl.dot`:
+
+- `ieee` — fp32 activations and `torch.backends.cuda.matmul.allow_tf32` off
+- `tf32` — fp32 activations and `allow_tf32` on
+- `bf16` — bf16 activations with fp32 masters (tiles downcast for the GEMM, accumulate in fp32)
+
+bf16 weights are ineligible and fall back to `SwiGLUTransition`. Sequence length is not a specialize key.
+
+```bash
+# Default: use Triton when eligible
+OPENFOLD3_FUSED_SWIGLU_TRANSITION=1
+
+# Force the SwiGLUTransition primitives
+OPENFOLD3_FUSED_SWIGLU_TRANSITION=0
+```
