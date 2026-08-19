@@ -28,6 +28,22 @@ from openfold3.core.utils.chunk_utils import (
 from openfold3.core.utils.relpos import relpos_complex
 
 
+def _ln_linear(x: torch.Tensor, layer_norm, linear) -> torch.Tensor:
+    from openfold3.core.kernels.triton.fused_ln_linear import (
+        fused_ln_linear,
+        is_fused_ln_linear_eligible,
+    )
+
+    gamma = layer_norm.weight
+    if gamma is not None and is_fused_ln_linear_eligible(
+        x, gamma, layer_norm.bias, linear.weight, linear.bias
+    ):
+        return fused_ln_linear(
+            x, gamma, layer_norm.bias, linear.weight, linear.bias, layer_norm.eps
+        )
+    return linear(layer_norm(x))
+
+
 class DiffusionConditioning(nn.Module):
     """
     Implements AF3 Algorithm 21.
@@ -150,7 +166,7 @@ class DiffusionConditioning(nn.Module):
         ).to(dtype=zij_trunk.dtype)
 
         zij = torch.cat([zij_trunk, relpos_zij], dim=-1)
-        return self.linear_z(self.layer_norm_z(zij))
+        return _ln_linear(zij, self.layer_norm_z, self.linear_z)
 
     def _embed_zij_chunked(
         self,
@@ -178,7 +194,9 @@ class DiffusionConditioning(nn.Module):
                 [zij_trunk[..., row_slice, :, :], relpos_chunk], dim=-1
             )
             del relpos_chunk
-            out[..., row_slice, :, :] = self.linear_z(self.layer_norm_z(cat_chunk))
+            out[..., row_slice, :, :] = _ln_linear(
+                cat_chunk, self.layer_norm_z, self.linear_z
+            )
             del cat_chunk
         return out
 
@@ -195,12 +213,12 @@ class DiffusionConditioning(nn.Module):
 
         # Single conditioning
         si = torch.cat([si_trunk, si_input], dim=-1)
-        si = self.linear_s(self.layer_norm_s(si))
+        si = _ln_linear(si, self.layer_norm_s, self.linear_s)
 
         n = 0.25 * torch.log(t / self.sigma_data)
         n = self.fourier_emb(n.unsqueeze(-1))
 
-        si = si + self.linear_n(self.layer_norm_n(n)).unsqueeze(-2)
+        si = si + _ln_linear(n, self.layer_norm_n, self.linear_n).unsqueeze(-2)
 
         return si, zij
 
