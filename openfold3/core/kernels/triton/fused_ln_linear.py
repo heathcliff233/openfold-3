@@ -15,13 +15,12 @@
 # by Liang Hong <lhong22@cse.cuhk.edu.hk>: fused LayerNorm-to-Linear
 # (Triton) with training backward.
 
-"""Fused LayerNorm → Linear (Triton).
+"""Fused LayerNorm → Linear backbone (Triton).
 
-One program owns a row tile, computes LN in registers, then loops over
-output-channel tiles. ``M`` is not an autotune or specialize key. Training
-saves ``x`` / ``mean`` / ``rstd`` and rematerializes the LN output in exclusive
-split-M ``dW`` and fused ``dX`` kernels. Ineligible shapes use
-``F.layer_norm`` + ``F.linear``.
+Shared tile helpers (``_ln_fwd``, ``_linear_from_xhat``, ``dW`` / ``dX``) plus
+the dense-concat wrapper. ``fused_embed_zij`` is a separate kernel family that
+only swaps the row loader. ``M`` is not an autotune or specialize key.
+Ineligible shapes use ``F.layer_norm`` + ``F.linear``.
 """
 
 from __future__ import annotations
@@ -220,6 +219,111 @@ if _TRITON_AVAILABLE:
             other=0.0,
         )
 
+    @triton.jit
+    def _ln_fwd(x, gamma, beta, k_mask, K, eps, HAS_LN_BIAS: tl.constexpr):
+        mean = tl.sum(x, axis=1) / K
+        x_centered = tl.where(k_mask[None, :], x - mean[:, None], 0.0)
+        rstd = 1.0 / tl.sqrt(tl.sum(x_centered * x_centered, axis=1) / K + eps)
+        x_hat = x_centered * rstd[:, None] * gamma[None, :]
+        if HAS_LN_BIAS:
+            x_hat = x_hat + tl.where(k_mask[None, :], beta[None, :], 0.0)
+        return mean, rstd, x_hat
+
+    @triton.jit
+    def _linear_from_xhat(
+        Y_ptr,
+        W_ptr,
+        Bias_ptr,
+        x_hat,
+        offs_m64,
+        offs_k,
+        m_mask,
+        k_mask,
+        stride_y_m,
+        N,
+        K,
+        HAS_LIN_BIAS: tl.constexpr,
+        GEMM_MODE: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        for n0 in range(0, N, BLOCK_N):
+            offs_n = n0 + tl.arange(0, BLOCK_N)
+            n_mask = offs_n < N
+            w = _load_w(W_ptr, offs_n, offs_k, K, n_mask, k_mask)
+            acc = _dot_f32(x_hat, tl.trans(w), GEMM_MODE)
+            if HAS_LIN_BIAS:
+                acc = acc + tl.load(Bias_ptr + offs_n, mask=n_mask, other=0.0).to(
+                    tl.float32
+                )
+            _store2d(Y_ptr, acc, offs_m64, offs_n, stride_y_m, m_mask, n_mask)
+
+    @triton.jit
+    def _ln_out_from_x(x, mean, rstd, gamma, beta, k_mask, HAS_LN_BIAS: tl.constexpr):
+        x_norm = tl.where(k_mask[None, :], (x - mean[:, None]) * rstd[:, None], 0.0)
+        ln_out = x_norm * gamma[None, :]
+        if HAS_LN_BIAS:
+            ln_out = ln_out + tl.where(k_mask[None, :], beta[None, :], 0.0)
+        return ln_out
+
+    @triton.jit
+    def _dx_ln_from_go(
+        GO_ptr,
+        W_ptr,
+        offs_m64,
+        offs_k,
+        m_mask,
+        k_mask,
+        stride_go_m,
+        N,
+        K,
+        GEMM_MODE: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        dx_ln = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+        for n0 in range(0, N, BLOCK_N):
+            offs_n = n0 + tl.arange(0, BLOCK_N)
+            n_mask = offs_n < N
+            go = _load2d(GO_ptr, offs_m64, offs_n, stride_go_m, m_mask, n_mask)
+            w = _load_w(W_ptr, offs_n, offs_k, K, n_mask, k_mask)
+            dx_ln += _dot_f32(go, w, GEMM_MODE)
+        return tl.where(m_mask[:, None] & k_mask[None, :], dx_ln, 0.0)
+
+    @triton.jit
+    def _ln_bwd_store(
+        GX_ptr,
+        PGamma_ptr,
+        PBeta_ptr,
+        x,
+        dx_ln,
+        mean,
+        rstd,
+        gamma,
+        offs_m,
+        offs_m64,
+        offs_k,
+        m_mask,
+        k_mask,
+        stride_gx_m,
+        K,
+    ):
+        x_norm = tl.where(k_mask[None, :], (x - mean[:, None]) * rstd[:, None], 0.0)
+        dx_hat = dx_ln * gamma[None, :]
+        grad_mean = tl.sum(dx_hat, axis=1) / K
+        grad_proj = tl.sum(dx_hat * x_norm, axis=1) / K
+        gx = rstd[:, None] * (
+            dx_hat - grad_mean[:, None] - x_norm * grad_proj[:, None]
+        )
+        _store2d(GX_ptr, gx, offs_m64, offs_k, stride_gx_m, m_mask, k_mask)
+        pid = tl.program_id(0)
+        tl.store(
+            PGamma_ptr + pid * K + offs_k,
+            tl.sum(dx_ln * x_norm, axis=0),
+            mask=k_mask,
+        )
+        tl.store(PBeta_ptr + pid * K + offs_k, tl.sum(dx_ln, axis=0), mask=k_mask)
+
     @_autotuned(
         _GEMM_TILES,
         ["GEMM_MODE", "K", "N", "HAS_LN_BIAS", "HAS_LIN_BIAS"],
@@ -265,27 +369,31 @@ if _TRITON_AVAILABLE:
         k_mask = offs_k < K
 
         x = _load2d(X_ptr, offs_m64, offs_k, stride_x_m, m_mask, k_mask).to(tl.float32)
-        mean = tl.sum(x, axis=1) / K
-        x_centered = tl.where(k_mask[None, :], x - mean[:, None], 0.0)
-        rstd = 1.0 / tl.sqrt(tl.sum(x_centered * x_centered, axis=1) / K + eps)
         gamma = tl.load(Gamma_ptr + offs_k, mask=k_mask, other=0.0).to(tl.float32)
-        x_hat = x_centered * rstd[:, None] * gamma[None, :]
-        if HAS_LN_BIAS:
-            beta = tl.load(Beta_ptr + offs_k, mask=k_mask, other=0.0).to(tl.float32)
-            x_hat = x_hat + tl.where(k_mask[None, :], beta[None, :], 0.0)
+        beta = (
+            tl.load(Beta_ptr + offs_k, mask=k_mask, other=0.0).to(tl.float32)
+            if HAS_LN_BIAS
+            else 0.0
+        )
+        mean, rstd, x_hat = _ln_fwd(x, gamma, beta, k_mask, K, eps, HAS_LN_BIAS)
         tl.store(Mean_ptr + offs_m, mean, mask=m_mask)
         tl.store(Rstd_ptr + offs_m, rstd, mask=m_mask)
-
-        for n0 in range(0, N, BLOCK_N):
-            offs_n = n0 + tl.arange(0, BLOCK_N)
-            n_mask = offs_n < N
-            w = _load_w(W_ptr, offs_n, offs_k, K, n_mask, k_mask)
-            acc = _dot_f32(x_hat, tl.trans(w), GEMM_MODE)
-            if HAS_LIN_BIAS:
-                acc = acc + tl.load(Bias_ptr + offs_n, mask=n_mask, other=0.0).to(
-                    tl.float32
-                )
-            _store2d(Y_ptr, acc, offs_m64, offs_n, stride_y_m, m_mask, n_mask)
+        _linear_from_xhat(
+            Y_ptr,
+            W_ptr,
+            Bias_ptr,
+            x_hat,
+            offs_m64,
+            offs_k,
+            m_mask,
+            k_mask,
+            stride_y_m,
+            N,
+            K,
+            HAS_LIN_BIAS,
+            GEMM_MODE,
+            BLOCK_N,
+        )
 
     @_autotuned(
         _DW_TILES,
@@ -346,13 +454,12 @@ if _TRITON_AVAILABLE:
             )
             mean = tl.load(Mean_ptr + offs_m, mask=m_mask, other=0.0)
             rstd = tl.load(Rstd_ptr + offs_m, mask=m_mask, other=0.0)
-            x_norm = tl.where(
-                k_mask[None, :], (x - mean[:, None]) * rstd[:, None], 0.0
+            beta = (
+                tl.load(Beta_ptr + offs_k, mask=k_mask, other=0.0).to(tl.float32)
+                if HAS_LN_BIAS
+                else 0.0
             )
-            ln_out = x_norm * gamma[None, :]
-            if HAS_LN_BIAS:
-                beta = tl.load(Beta_ptr + offs_k, mask=k_mask, other=0.0).to(tl.float32)
-                ln_out = ln_out + tl.where(k_mask[None, :], beta[None, :], 0.0)
+            ln_out = _ln_out_from_x(x, mean, rstd, gamma, beta, k_mask, HAS_LN_BIAS)
             go = _load2d(GO_ptr, offs_m64, offs_n, stride_go_m, m_mask, n_mask).to(
                 tl.float32
             )
@@ -416,28 +523,38 @@ if _TRITON_AVAILABLE:
         mean = tl.load(Mean_ptr + offs_m, mask=m_mask, other=0.0)
         rstd = tl.load(Rstd_ptr + offs_m, mask=m_mask, other=0.0)
         gamma = tl.load(Gamma_ptr + offs_k, mask=k_mask, other=0.0).to(tl.float32)
-        x_norm = tl.where(k_mask[None, :], (x - mean[:, None]) * rstd[:, None], 0.0)
-        dx_ln = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
-        for n0 in range(0, N, BLOCK_N):
-            offs_n = n0 + tl.arange(0, BLOCK_N)
-            n_mask = offs_n < N
-            go = _load2d(GO_ptr, offs_m64, offs_n, stride_go_m, m_mask, n_mask)
-            w = _load_w(W_ptr, offs_n, offs_k, K, n_mask, k_mask)
-            dx_ln += _dot_f32(go, w, GEMM_MODE)
-        dx_ln = tl.where(m_mask[:, None] & k_mask[None, :], dx_ln, 0.0)
-        dx_hat = dx_ln * gamma[None, :]
-        grad_mean = tl.sum(dx_hat, axis=1) / K
-        grad_proj = tl.sum(dx_hat * x_norm, axis=1) / K
-        gx = rstd[:, None] * (
-            dx_hat - grad_mean[:, None] - x_norm * grad_proj[:, None]
+        dx_ln = _dx_ln_from_go(
+            GO_ptr,
+            W_ptr,
+            offs_m64,
+            offs_k,
+            m_mask,
+            k_mask,
+            stride_go_m,
+            N,
+            K,
+            GEMM_MODE,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
         )
-        _store2d(GX_ptr, gx, offs_m64, offs_k, stride_gx_m, m_mask, k_mask)
-        tl.store(
-            PGamma_ptr + pid * K + offs_k,
-            tl.sum(dx_ln * x_norm, axis=0),
-            mask=k_mask,
+        _ln_bwd_store(
+            GX_ptr,
+            PGamma_ptr,
+            PBeta_ptr,
+            x,
+            dx_ln,
+            mean,
+            rstd,
+            gamma,
+            offs_m,
+            offs_m64,
+            offs_k,
+            m_mask,
+            k_mask,
+            stride_gx_m,
+            K,
         )
-        tl.store(PBeta_ptr + pid * K + offs_k, tl.sum(dx_ln, axis=0), mask=k_mask)
 
 else:  # pragma: no cover
 

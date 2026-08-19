@@ -30,7 +30,6 @@ from openfold3.core.kernels.triton.fused_ln_linear import (
     fused_ln_linear,
     is_fused_ln_linear_eligible,
 )
-from openfold3.core.model.layers.diffusion_conditioning import DiffusionConditioning
 from openfold3.core.model.primitives.linear import Linear
 from openfold3.core.model.primitives.normalization import LayerNorm
 
@@ -39,7 +38,7 @@ pytestmark = [
     compare_utils.skip_unless_triton_installed(),
 ]
 
-# DiffusionConditioning._embed_zij: c_z=128 + relpos 139.
+# Dense-concat fallback shape: c_z=128 + relpos 139.
 C_IN, C_OUT, N_TOKEN = 267, 128, 64
 
 
@@ -150,35 +149,6 @@ def test_small_m_is_ineligible():
     _set_tf32(False)
     gamma, beta, weight, bias, x = _pair(n_token=32)
     assert not is_fused_ln_linear_eligible(x, gamma, beta, weight, bias)
-
-
-def test_module_dispatch_matches_eager_when_disabled(monkeypatch):
-    _set_tf32(False)
-    torch.manual_seed(3)
-    n_token = N_TOKEN
-    module = DiffusionConditioning(
-        c_s_input=449,
-        c_s=384,
-        c_z=128,
-        c_fourier_emb=256,
-        max_relative_idx=32,
-        max_relative_chain=2,
-        sigma_data=16.0,
-    ).cuda().eval()
-    batch = {
-        "token_index": torch.arange(n_token, device="cuda")[None],
-        "token_mask": torch.ones(1, n_token, device="cuda"),
-        "residue_index": torch.arange(n_token, device="cuda")[None],
-        "sym_id": torch.zeros(1, n_token, device="cuda"),
-        "asym_id": torch.zeros(1, n_token, device="cuda"),
-        "entity_id": torch.zeros(1, n_token, device="cuda"),
-    }
-    zij = torch.randn(1, n_token, n_token, 128, device="cuda") * 0.5
-    with torch.inference_mode():
-        y_fused = module._embed_zij(batch, zij)
-        monkeypatch.setenv("OPENFOLD3_FUSED_LN_LINEAR", "0")
-        y_eager = module._embed_zij(batch, zij)
-    torch.testing.assert_close(y_fused, y_eager, atol=1e-5, rtol=1e-5)
 
 
 def test_layer_norm_linear_modules_match_fused():

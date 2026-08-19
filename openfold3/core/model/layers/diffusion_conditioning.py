@@ -156,6 +156,18 @@ class DiffusionConditioning(nn.Module):
         batch: dict,
         zij_trunk: torch.Tensor,
     ) -> torch.Tensor:
+        from openfold3.core.kernels.triton.fused_embed_zij import try_fused_embed_zij
+
+        fused = try_fused_embed_zij(
+            zij_trunk,
+            batch,
+            self.layer_norm_z,
+            self.linear_z,
+            self.max_relative_idx,
+            self.max_relative_chain,
+        )
+        if fused is not None:
+            return fused
         if not torch.is_grad_enabled():
             return self._embed_zij_chunked(batch, zij_trunk)
 
@@ -213,12 +225,12 @@ class DiffusionConditioning(nn.Module):
 
         # Single conditioning
         si = torch.cat([si_trunk, si_input], dim=-1)
-        si = _ln_linear(si, self.layer_norm_s, self.linear_s)
+        si = self.linear_s(self.layer_norm_s(si))
 
         n = 0.25 * torch.log(t / self.sigma_data)
         n = self.fourier_emb(n.unsqueeze(-1))
 
-        si = si + _ln_linear(n, self.layer_norm_n, self.linear_n).unsqueeze(-2)
+        si = si + self.linear_n(self.layer_norm_n(n)).unsqueeze(-2)
 
         return si, zij
 
