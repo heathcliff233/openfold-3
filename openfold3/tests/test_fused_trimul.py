@@ -224,6 +224,73 @@ def test_module_dispatch_uses_fused():
     torch.testing.assert_close(y_mod, y_ref, atol=8e-4, rtol=8e-4)
 
 
+def test_autograd_matches_eager_tf32():
+    _set_tf32(True)
+    module = _module()
+    z, mask = _pair()
+    weights = _weights(module)
+    leaves_e = [t.detach().requires_grad_(True) for t in (z, *weights)]
+    y_e = eager_trimul(leaves_e[0], mask, *leaves_e[1:], True)
+    y_e.square().mean().backward()
+    grads_ref = [t.grad.detach().clone() for t in leaves_e]
+    leaves = [t.detach().requires_grad_(True) for t in (z, *weights)]
+    y = fused_trimul(leaves[0], mask, *leaves[1:], True)
+    y.square().mean().backward()
+    torch.testing.assert_close(y, y_e, atol=5e-3, rtol=2e-3)
+    for act, ref in zip(leaves, grads_ref):
+        torch.testing.assert_close(act.grad, ref, atol=5e-3, rtol=2e-3)
+
+
+def test_autograd_matches_eager_bf16_mixed():
+    _set_tf32(False)
+    module = _module()
+    z, mask = _pair(dtype=torch.bfloat16)
+    weights = _weights(module)
+    leaves_e = [t.detach().requires_grad_(True) for t in (z, *weights)]
+    y_e = eager_trimul(leaves_e[0], mask, *leaves_e[1:], True)
+    y_e.square().mean().backward()
+    grads_ref = [t.grad.detach().clone() for t in leaves_e]
+    leaves = [t.detach().requires_grad_(True) for t in (z, *weights)]
+    y = fused_trimul(leaves[0], mask, *leaves[1:], True)
+    y.square().mean().backward()
+    assert y.dtype == torch.bfloat16
+    torch.testing.assert_close(y.float(), y_e.float(), atol=8e-2, rtol=2e-2)
+    for act, ref in zip(leaves, grads_ref):
+        torch.testing.assert_close(act.grad.float(), ref.float(), atol=8e-2, rtol=2e-2)
+
+
+def test_autograd_incoming_ieee():
+    _set_tf32(False)
+    module = _module(outgoing=False)
+    z, mask = _pair()
+    weights = _weights(module)
+    leaves_e = [t.detach().requires_grad_(True) for t in (z, *weights)]
+    y_e = eager_trimul(leaves_e[0], mask, *leaves_e[1:], False)
+    y_e.square().mean().backward()
+    grads_ref = [t.grad.detach().clone() for t in leaves_e]
+    leaves = [t.detach().requires_grad_(True) for t in (z, *weights)]
+    y = fused_trimul(leaves[0], mask, *leaves[1:], False)
+    y.square().mean().backward()
+    torch.testing.assert_close(y, y_e, atol=1e-4, rtol=1e-4)
+    for act, ref in zip(leaves, grads_ref):
+        torch.testing.assert_close(act.grad, ref, atol=5e-4, rtol=2e-4)
+
+
+def test_weight_gradients_are_deterministic():
+    _set_tf32(False)
+    module = _module()
+    z, mask = _pair(n=70, dtype=torch.bfloat16)
+    weights = _weights(module)
+    grad_out = torch.randn(1, 70, 70, C_Z, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        leaves = [t.detach().requires_grad_(True) for t in (z, *weights)]
+        fused_trimul(leaves[0], mask, *leaves[1:], True).backward(grad_out)
+        return [t.grad.detach().clone() for t in leaves]
+
+    assert all(torch.equal(a, b) for a, b in zip(run(), run()))
+
+
 def test_compile_reuse_across_lengths():
     script = r"""
 import json
@@ -232,7 +299,13 @@ from pathlib import Path
 import torch
 from openfold3.core.kernels.triton.fused_trimul import (
     _gated_dual_gemm_kernel,
+    _gated_dw_kernel,
+    _gated_dx_kernel,
+    _gated_out_bwd_dw_kernel,
+    _gated_out_bwd_dx_kernel,
     _gated_out_from_dm_kernel,
+    _batched_gemm_kernel,
+    _ln_apply_kernel,
     _ln_stats_kernel,
     fused_trimul,
 )
@@ -250,6 +323,12 @@ def snapshot():
         "dual": count("_gated_dual_gemm_kernel"),
         "out": count("_gated_out_from_dm_kernel"),
         "stats": count("_ln_stats_kernel"),
+        "out_dw": count("_gated_out_bwd_dw_kernel"),
+        "out_dx": count("_gated_out_bwd_dx_kernel"),
+        "gated_dw": count("_gated_dw_kernel"),
+        "gated_dx": count("_gated_dx_kernel"),
+        "ln_apply": count("_ln_apply_kernel"),
+        "gemm": count("_batched_gemm_kernel"),
     }
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -274,6 +353,9 @@ def run(n):
     mask = torch.ones(1, n, n, device="cuda")
     with torch.inference_mode():
         fused_trimul(z, mask, *weights, True)
+    zd = z.detach().requires_grad_(True)
+    leaves = [t.detach().requires_grad_(True) for t in weights]
+    fused_trimul(zd, mask, *leaves, True).backward(torch.ones_like(z))
 
 run(lengths[0])
 after_first = snapshot()
@@ -283,6 +365,10 @@ after_all = snapshot()
 assert after_first["dual"] >= 1, after_first
 assert after_first["out"] >= 1, after_first
 assert after_first["stats"] >= 1, after_first
+assert after_first["out_dw"] >= 1 and after_first["out_dx"] >= 1, after_first
+assert after_first["gated_dw"] >= 1 and after_first["gated_dx"] >= 1, after_first
+assert after_first["ln_apply"] >= 1, after_first
+assert after_first["gemm"] >= 1, after_first
 assert after_all == after_first, (after_first, after_all)
 print(json.dumps({"after_first": after_first, "after_all": after_all}))
 """
