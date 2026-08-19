@@ -82,7 +82,7 @@ OPENFOLD3_FUSED_RELPOS=1
 OPENFOLD3_FUSED_RELPOS=0
 ```
 
-If `linear_relpos` has a bias, the classic `relpos_complex` + `Linear` path is retained.
+If `linear_relpos` has a bias, the classic `relpos_complex` + `Linear` path is retained. Diffusion conditioning `_embed_zij` is a different op (`LN(cat(z, one-hot)) → Linear`); see **Fused LayerNorm-to-Linear** below.
 
 # Fused pair SwiGLU transition
 
@@ -106,4 +106,28 @@ OPENFOLD3_FUSED_SWIGLU_TRANSITION=1
 
 # Force the SwiGLUTransition primitives
 OPENFOLD3_FUSED_SWIGLU_TRANSITION=0
+```
+
+# Fused LayerNorm-to-Linear
+
+`DiffusionConditioning` can fuse LayerNorm → Linear as one length-generic Triton kernel instead of `F.layer_norm` + `F.linear`. The shared backbone is `fused_ln_linear`. `_embed_zij` (`LN(cat(zij_trunk, relpos_complex)) → Linear`) uses a separate wrapper that synthesizes the concat row in registers from trunk `z` and the same compact relpos indices as the input-embedder path, so the 139-d one-hot and 267-d concat are never written. Sibling sites `linear_s` / `linear_n` stay eager (`c_in` or row count is ineligible).
+
+Under training, an autograd wrapper saves `x` / `mean` / `rstd` (or `z` plus indices for `_embed_zij`) and rematerializes the LN output; `dW` uses exclusive split-M tiles (deterministic, no atomics) and accumulates in fp32. Ineligible shapes keep the eager primitives, and inference `_embed_zij` keeps the row-chunked `relpos_complex` fallback.
+
+## Triton kernel
+
+On CUDA with a contiguous activation, `float32` or `bfloat16` activations, fp32 Parameter masters, `c_in ≤ 512`, `c_out ≤ 512`, and at least 4096 rows, the fused path uses one `GEMM_MODE` for every `tl.dot`:
+
+- `ieee` — fp32 activations and `torch.backends.cuda.matmul.allow_tf32` off
+- `tf32` — fp32 activations and `allow_tf32` on
+- `bf16` — bf16 activations with fp32 masters (tiles downcast for the GEMM, accumulate in fp32)
+
+bf16 weights are ineligible. Sequence length is not a specialize key. `_embed_zij` matches the production site (no LN offset, no Linear bias).
+
+```bash
+# Default: use Triton when eligible
+OPENFOLD3_FUSED_LN_LINEAR=1
+
+# Force eager LN + Linear (and the chunked _embed_zij fallback)
+OPENFOLD3_FUSED_LN_LINEAR=0
 ```
