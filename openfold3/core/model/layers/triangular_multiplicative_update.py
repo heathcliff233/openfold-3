@@ -1115,6 +1115,18 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
         Returns:
             [*, N_res, N_res, C_z] output tensor
         """
+        from openfold3.core.kernels.triton.fused_trimul import fused_trimul_from_module
+
+        fused = fused_trimul_from_module(
+            self,
+            z,
+            mask,
+            residual=z if inplace_safe and _add_with_inplace else None,
+            chunk_cap=trimul_chunk_cap() if inplace_safe else None,
+        )
+        if fused is not None:
+            return fused
+
         ## NOTE: valid for inplace safe and use_cueq_triangle_kernels to be enabled
         ## inplace safe is used across the codebase and so should not
         ## be disabled. So if use_cueq_triangle_kernels is True, it will always

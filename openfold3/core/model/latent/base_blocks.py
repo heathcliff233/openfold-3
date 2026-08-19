@@ -319,6 +319,8 @@ class PairBlock(nn.Module):
         chunked_trimul = use_chunked_trimul(inplace_safe)
         use_cueq_trimul = use_cueq_triangle_kernels and not chunked_trimul
         # cuEq supersedes inplace_safe unless a trimul chunk cap forces eager.
+        # Fused Triton trimul is tried first inside the module and may write the
+        # residual in place when inplace_safe and _add_with_inplace.
         inplace_safe = inplace_safe and (not use_cueq_trimul)
         ## VS: having both inplace_safe and use_cueq_triangle_kernels set to
         ## true causes `z = z + self.ps_dropout_row_layer(tmu_update)` below
