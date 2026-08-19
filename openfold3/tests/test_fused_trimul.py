@@ -306,7 +306,7 @@ from openfold3.core.kernels.triton.fused_trimul import (
     _gated_out_from_dm_kernel,
     _batched_gemm_kernel,
     _ln_apply_kernel,
-    _ln_stats_kernel,
+    _ln_fwd_kernel,
     fused_trimul,
 )
 from openfold3.core.model.layers.triangular_multiplicative_update import (
@@ -322,7 +322,7 @@ def snapshot():
     return {
         "dual": count("_gated_dual_gemm_kernel"),
         "out": count("_gated_out_from_dm_kernel"),
-        "stats": count("_ln_stats_kernel"),
+        "ln_fwd": count("_ln_fwd_kernel"),
         "out_dw": count("_gated_out_bwd_dw_kernel"),
         "out_dx": count("_gated_out_bwd_dx_kernel"),
         "gated_dw": count("_gated_dw_kernel"),
@@ -364,7 +364,7 @@ for n in lengths[1:]:
 after_all = snapshot()
 assert after_first["dual"] >= 1, after_first
 assert after_first["out"] >= 1, after_first
-assert after_first["stats"] >= 1, after_first
+assert after_first["ln_fwd"] >= 1, after_first
 assert after_first["out_dw"] >= 1 and after_first["out_dx"] >= 1, after_first
 assert after_first["gated_dw"] >= 1 and after_first["gated_dx"] >= 1, after_first
 assert after_first["ln_apply"] >= 1, after_first

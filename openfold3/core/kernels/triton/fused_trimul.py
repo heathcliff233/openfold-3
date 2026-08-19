@@ -19,10 +19,14 @@
 
 LN_in → gated A/B projections → triangle einsum → LN_out → gated output
 [+ residual]. ``M`` / sequence length is not an autotune or specialize key.
-The triangle GEMM autotunes tiles on ``GEMM_MODE`` only; packed ``[C,B,N,N]``
-panels keep a constexpr inner stride of 1 (layout, not target length).
-``dX`` / ``dA`` / ``dB`` stay CH; only the contract result is permuted to MD
-for LN. Gated ``dW``/``dX`` load ``dA``/``dB`` as ``[C,M]``.
+GEMM and LN tiles autotune on ``GEMM_MODE`` (LN on an empty key) so each
+GPU picks its own winner. Packed ``[C,B,N,N]`` panels keep a constexpr
+inner stride of 1 (layout, not target length). Forward materializes LN_in
+once, then dual-gemm and the output-gate MMAs load matching dtypes (bf16
+masters are downcast once; no in-loop LN).
+Backward keeps ``X`` / ``dX`` / ``dA`` / ``dB`` CH and rematerializes
+LN_out stats in the output-gate kernels. Gated ``dW``/``dX`` load ``dA``/``dB``
+as ``[C,M]``.
 Training saves A/B/X from the forward (non-reentrant checkpoint packs the
 first-forward copies so they do not stack). Exclusive split-M ``dW`` plus
 a fused output-gate backward that never stores ``g`` / ``val`` /
@@ -61,6 +65,54 @@ _TRI_GEMM_TILES = (
     (128, 64, 32, 8, 3),
     (128, 128, 32, 8, 3),
 )
+# Dual-gemm: no 64×64 — a GEMM_MODE-only cache would otherwise keep the
+# small-M winner for every later length. Do not mark pointer args
+# do_not_specialize_on_alignment — that spills 64×128×32. TILE_K must
+# divide K (no K-mask in the inner loop). M stays do_not_specialize.
+_DUAL_GEMM_TILES = (
+    (64, 128, 16, 4, 2),
+    (64, 128, 16, 4, 3),
+    (64, 128, 16, 8, 2),
+    (64, 128, 32, 4, 2),
+    (64, 128, 32, 8, 2),
+    (64, 128, 32, 8, 3),
+)
+# D-major output. TILE_N<=128 keeps in-place CZ<=128 safe. No 64×64.
+_FWD_GEMM_TILES = (
+    (128, 64, 16, 4, 2),
+    (128, 64, 16, 4, 3),
+    (128, 64, 32, 8, 2),
+    (64, 128, 16, 4, 2),
+    (64, 128, 32, 4, 2),
+    (64, 128, 32, 8, 2),
+    (64, 128, 16, 8, 3),
+)
+# LN row tiles (TILE_M / BLOCK_M, warps, stages). Partials size to min M.
+_LN_ROW_TILES = (
+    (32, 4, 2),
+    (64, 4, 2),
+    (64, 8, 2),
+    (128, 8, 2),
+)
+_LN_BWD_TILES = (
+    (16, 4, 1),
+    (32, 4, 1),
+    (32, 8, 1),
+    (64, 4, 1),
+)
+_BWD_GEMM_TILES = (
+    (16, 32, 4, 1),
+    (16, 64, 4, 1),
+    (32, 32, 4, 1),
+    (32, 64, 4, 1),
+    (32, 64, 4, 2),
+    (64, 32, 4, 1),
+    (64, 32, 8, 1),
+)
+_BWD_MIN_BLOCK_M = 16
+# First dual-gemm launch below this M warms autotune on a large dummy
+# grid so a test-sized call cannot lock the GEMM_MODE winner.
+_DUAL_WARM_M = 65536
 _TRUE = {"1", "true", "yes", "on"}
 
 
@@ -165,30 +217,58 @@ def eager_trimul(
 
 if _TRITON_AVAILABLE:
 
-    _DUAL_GEMM_CFG = dict(
-        TILE_M=64, TILE_N=128, TILE_K=16, GROUP_M=8, num_warps=4, num_stages=2
-    )
-    _DUAL_GEMM_CFG_N64 = dict(
-        TILE_M=64, TILE_N=64, TILE_K=16, GROUP_M=8, num_warps=4, num_stages=2
-    )
-    _OUT_DM_CFG = dict(
-        TILE_M=64, TILE_N=128, TILE_K=16, GROUP_M=8, num_warps=4, num_stages=2
-    )
-    _OUT_GEMM_CFG = dict(
-        TILE_M=64, TILE_N=128, TILE_K=16, GROUP_M=8, num_warps=4, num_stages=2
-    )
-    _LN_STATS_TILE_M = 64
-    _LN_TRANSPOSE_TILE_M = 64
-
-    def _tri_gemm_configs():
+    def _gemm_configs(tiles):
         return [
             triton.Config(
                 {"TILE_M": tm, "TILE_N": tn, "TILE_K": tk, "GROUP_M": 8},
                 num_warps=warps,
                 num_stages=stages,
             )
-            for tm, tn, tk, warps, stages in _TRI_GEMM_TILES
+            for tm, tn, tk, warps, stages in tiles
         ]
+
+    def _dual_gemm_configs():
+        return [
+            triton.Config(
+                {"TILE_M": tm, "TILE_N": tn, "TILE_K": tk},
+                num_warps=warps,
+                num_stages=stages,
+            )
+            for tm, tn, tk, warps, stages in _DUAL_GEMM_TILES
+        ]
+
+    def _ln_row_configs(tiles):
+        return [
+            triton.Config(
+                {"TILE_M": tile_m},
+                num_warps=warps,
+                num_stages=stages,
+            )
+            for tile_m, warps, stages in tiles
+        ]
+
+    def _ln_bwd_configs():
+        return [
+            triton.Config(
+                {"BLOCK_M": block_m},
+                num_warps=warps,
+                num_stages=stages,
+            )
+            for block_m, warps, stages in _LN_BWD_TILES
+        ]
+
+    def _bwd_gemm_configs():
+        return [
+            triton.Config(
+                {"BLOCK_M": block_m, "BLOCK_N": block_n},
+                num_warps=warps,
+                num_stages=stages,
+            )
+            for block_m, block_n, warps, stages in _BWD_GEMM_TILES
+        ]
+
+    def _tri_gemm_configs():
+        return _gemm_configs(_TRI_GEMM_TILES)
 
     def _prune_tri_gemm(configs, named_args, **kwargs):
         mode = kwargs.get("GEMM_MODE", named_args.get("GEMM_MODE"))
@@ -200,6 +280,61 @@ if _TRITON_AVAILABLE:
                 and (cfg.kwargs["TILE_M"] >= 128 or cfg.kwargs["TILE_K"] >= 64)
             )
         ]
+        return kept or configs[:1]
+
+    def _fwd_gemm_configs():
+        return _gemm_configs(_FWD_GEMM_TILES)
+
+    def _prune_fwd_gemm(configs, named_args, **kwargs):
+        mode = kwargs.get("GEMM_MODE", named_args.get("GEMM_MODE"))
+        n_out = named_args.get("Nproj", named_args.get("CZ"))
+        kept = []
+        for cfg in configs:
+            if cfg.kwargs["TILE_K"] >= 64 or (
+                cfg.kwargs["TILE_M"] >= 128 and cfg.kwargs["TILE_N"] >= 128
+            ):
+                continue
+            if mode == "ieee" and cfg.kwargs["TILE_M"] >= 128:
+                continue
+            if n_out is not None and cfg.kwargs["TILE_N"] > n_out:
+                continue
+            k_in = named_args.get("K", named_args.get("CH"))
+            if k_in is not None and cfg.kwargs["TILE_K"] > k_in:
+                continue
+            kept.append(cfg)
+        return kept or configs[:1]
+
+    def _prune_dual_gemm(configs, named_args, **kwargs):
+        mode = kwargs.get("GEMM_MODE", named_args.get("GEMM_MODE"))
+        nproj = named_args.get("Nproj")
+        k = named_args.get("K")
+        kept = []
+        for cfg in configs:
+            tile_k = cfg.kwargs["TILE_K"]
+            tile_n = cfg.kwargs["TILE_N"]
+            if tile_k >= 64:
+                continue
+            if mode == "ieee" and tile_k >= 32:
+                continue
+            if nproj is not None and tile_n > nproj:
+                continue
+            if k is not None and (tile_k > k or k % tile_k != 0):
+                continue
+            kept.append(cfg)
+        return kept or configs[:1]
+
+    def _prune_bwd_gemm(configs, named_args, **kwargs):
+        mode = kwargs.get("GEMM_MODE", named_args.get("GEMM_MODE"))
+        n = named_args.get("N", named_args.get("CZ"))
+        kept = []
+        for cfg in configs:
+            block_m = cfg.kwargs["BLOCK_M"]
+            block_n = cfg.kwargs["BLOCK_N"]
+            if mode == "ieee" and (block_m >= 64 or block_n >= 64):
+                continue
+            if n is not None and block_n > n:
+                continue
+            kept.append(cfg)
         return kept or configs[:1]
 
     @triton.jit
@@ -230,6 +365,28 @@ if _TRITON_AVAILABLE:
         return tl.dot(a, b, input_precision="ieee", out_dtype=tl.float32)
 
     @triton.jit
+    def _mma(a, b, acc, GEMM_MODE: tl.constexpr):
+        """Accumulate ``a @ b`` into ``acc``. bf16 uses default tensor-core MMA."""
+        if GEMM_MODE == "bf16":
+            return tl.dot(
+                a.to(tl.bfloat16),
+                b.to(tl.bfloat16),
+                acc,
+                out_dtype=tl.float32,
+            )
+        a = a.to(tl.float32)
+        b = b.to(tl.float32)
+        if GEMM_MODE == "tf32":
+            return tl.dot(
+                _round_to_tf32(a),
+                _round_to_tf32(b),
+                acc,
+                input_precision="tf32",
+                out_dtype=tl.float32,
+            )
+        return tl.dot(a, b, acc, input_precision="ieee", out_dtype=tl.float32)
+
+    @triton.jit
     def _pid_mn(M, N, TILE_M: tl.constexpr, TILE_N: tl.constexpr, GROUP_M: tl.constexpr):
         pid_m_raw = tl.program_id(0)
         pid_n_raw = tl.program_id(1)
@@ -244,83 +401,83 @@ if _TRITON_AVAILABLE:
         pid_n = (pid % num_pid_in_group) // group_size_m
         return tl.cast(pid_m, tl.int64), tl.cast(pid_n, tl.int64)
 
-    @triton.jit(
-        do_not_specialize=["M", "eps"],
-        do_not_specialize_on_alignment=[
-            "x_ptr",
-            "wp_ptr",
-            "wg_ptr",
-            "mask_ptr",
-            "gamma_ptr",
-            "beta_ptr",
-            "ln_stats_ptr",
-            "out_ptr",
-        ],
+    @triton.autotune(
+        configs=_dual_gemm_configs(),
+        key=["GEMM_MODE"],
+        prune_configs_by={"early_config_prune": _prune_dual_gemm},
+        restore_value=["out_ptr"],
     )
+    @triton.jit(do_not_specialize=["M"])
     def _gated_dual_gemm_kernel(
         x_ptr,
         wp_ptr,
         wg_ptr,
         mask_ptr,
-        gamma_ptr,
-        beta_ptr,
-        ln_stats_ptr,
         out_ptr,
         M,
         Nproj,
         K,
-        eps,
         HAS_MASK: tl.constexpr,
-        HAS_LN_BIAS: tl.constexpr,
         GEMM_MODE: tl.constexpr,
         TILE_M: tl.constexpr,
         TILE_N: tl.constexpr,
         TILE_K: tl.constexpr,
-        GROUP_M: tl.constexpr,
     ):
-        pid_m, pid_n = _pid_mn(M, Nproj, TILE_M, TILE_N, GROUP_M)
+        """``x`` is already LayerNorm'd. Simple pid; K must divide ``TILE_K``."""
+        pid_m = tl.program_id(0).to(tl.int64)
+        pid_n = tl.program_id(1).to(tl.int64)
         M64 = tl.cast(M, tl.int64)
-        nproj64 = tl.cast(Nproj, tl.int64)
         k64 = tl.cast(K, tl.int64)
         offs_m = pid_m * TILE_M + tl.arange(0, TILE_M).to(tl.int64)
         offs_n = pid_n * TILE_N + tl.arange(0, TILE_N).to(tl.int64)
         offs_k = tl.arange(0, TILE_K).to(tl.int64)
         mask_m = offs_m < M64
-        mask_n = offs_n < nproj64
-
-        mean = tl.load(ln_stats_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)
-        rstd = tl.load(ln_stats_ptr + M64 + offs_m, mask=mask_m, other=0.0).to(
-            tl.float32
-        )
+        mask_n = offs_n < Nproj
+        x_ptrs = x_ptr + offs_m[:, None] * k64 + offs_k[None, :]
+        wp_ptrs = wp_ptr + offs_n[None, :] * k64 + offs_k[:, None]
+        wg_ptrs = wg_ptr + offs_n[None, :] * k64 + offs_k[:, None]
         gate_acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
         val_acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
-        for k_off in range(0, K, TILE_K):
-            k_range = k_off + offs_k
-            k_mask = k_range < k64
-            z_k = tl.load(
-                x_ptr + offs_m[:, None] * k64 + k_range[None, :],
-                mask=mask_m[:, None] & k_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            gamma_k = tl.load(gamma_ptr + k_range, mask=k_mask, other=0.0).to(tl.float32)
-            x_tile = (z_k - mean[:, None]) * rstd[:, None] * gamma_k[None, :]
-            if HAS_LN_BIAS:
-                beta_k = tl.load(beta_ptr + k_range, mask=k_mask, other=0.0).to(
-                    tl.float32
+        for _k in range(0, K, TILE_K):
+            x = tl.load(x_ptrs, mask=mask_m[:, None], other=0.0)
+            wp = tl.load(wp_ptrs, mask=mask_n[None, :], other=0.0)
+            wg = tl.load(wg_ptrs, mask=mask_n[None, :], other=0.0)
+            if GEMM_MODE == "bf16":
+                val_acc = tl.dot(x, wp, val_acc, out_dtype=tl.float32)
+                gate_acc = tl.dot(x, wg, gate_acc, out_dtype=tl.float32)
+            elif GEMM_MODE == "tf32":
+                val_acc = tl.dot(
+                    _round_to_tf32(x.to(tl.float32)),
+                    _round_to_tf32(wp.to(tl.float32)),
+                    val_acc,
+                    input_precision="tf32",
+                    out_dtype=tl.float32,
                 )
-                x_tile = x_tile + tl.where(k_mask[None, :], beta_k[None, :], 0.0)
-            wp = tl.load(
-                wp_ptr + offs_n[None, :] * k64 + k_range[:, None],
-                mask=mask_n[None, :] & k_mask[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            wg = tl.load(
-                wg_ptr + offs_n[None, :] * k64 + k_range[:, None],
-                mask=mask_n[None, :] & k_mask[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            val_acc += _dot_f32(x_tile, wp, GEMM_MODE)
-            gate_acc += _dot_f32(x_tile, wg, GEMM_MODE)
+                gate_acc = tl.dot(
+                    _round_to_tf32(x.to(tl.float32)),
+                    _round_to_tf32(wg.to(tl.float32)),
+                    gate_acc,
+                    input_precision="tf32",
+                    out_dtype=tl.float32,
+                )
+            else:
+                val_acc = tl.dot(
+                    x.to(tl.float32),
+                    wp.to(tl.float32),
+                    val_acc,
+                    input_precision="ieee",
+                    out_dtype=tl.float32,
+                )
+                gate_acc = tl.dot(
+                    x.to(tl.float32),
+                    wg.to(tl.float32),
+                    gate_acc,
+                    input_precision="ieee",
+                    out_dtype=tl.float32,
+                )
+            x_ptrs += TILE_K
+            wp_ptrs += TILE_K
+            wg_ptrs += TILE_K
 
         delta = tl.sigmoid(gate_acc) * val_acc
         if HAS_MASK:
@@ -332,6 +489,12 @@ if _TRITON_AVAILABLE:
             mask=mask_n[:, None] & mask_m[None, :],
         )
 
+    @triton.autotune(
+        configs=_fwd_gemm_configs(),
+        key=["GEMM_MODE"],
+        prune_configs_by={"early_config_prune": _prune_fwd_gemm},
+        restore_value=["out_ptr"],
+    )
     @triton.jit(
         do_not_specialize=["M", "eps_out"],
         do_not_specialize_on_alignment=[
@@ -340,9 +503,6 @@ if _TRITON_AVAILABLE:
             "wg_ptr",
             "wp_ptr",
             "residual_ptr",
-            "gamma_in_ptr",
-            "beta_in_ptr",
-            "ln_stats_ptr",
             "gamma_out_ptr",
             "beta_out_ptr",
             "out_ptr",
@@ -354,9 +514,6 @@ if _TRITON_AVAILABLE:
         wg_ptr,
         wp_ptr,
         residual_ptr,
-        gamma_in_ptr,
-        beta_in_ptr,
-        ln_stats_ptr,
         gamma_out_ptr,
         beta_out_ptr,
         out_ptr,
@@ -365,7 +522,6 @@ if _TRITON_AVAILABLE:
         CH,
         eps_out,
         WITH_ADD: tl.constexpr,
-        HAS_LN_IN_BIAS: tl.constexpr,
         HAS_LN_OUT_BIAS: tl.constexpr,
         GEMM_MODE: tl.constexpr,
         TILE_M: tl.constexpr,
@@ -388,11 +544,14 @@ if _TRITON_AVAILABLE:
         for k_off in range(0, CH, TILE_K):
             k_range = k_off + offs_k
             k_mask = k_range < ch64
-            x_k = tl.load(
-                x_dm_ptr + k_range[None, :] * m64 + offs_m[:, None],
-                mask=mask_m[:, None] & k_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
+            # [C,M] is contiguous along M; load [TILE_K, TILE_M] then transpose.
+            x_k = tl.trans(
+                tl.load(
+                    x_dm_ptr + k_range[:, None] * m64 + offs_m[None, :],
+                    mask=k_mask[:, None] & mask_m[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+            )
             x_k = tl.where(k_mask[None, :], x_k, 0.0)
             out_sum += tl.sum(x_k, axis=1)
             out_sumsq += tl.sum(x_k * x_k, axis=1)
@@ -404,11 +563,14 @@ if _TRITON_AVAILABLE:
         for k_off in range(0, CH, TILE_K):
             k_range = k_off + offs_k
             k_mask = k_range < ch64
-            x_k = tl.load(
-                x_dm_ptr + k_range[None, :] * m64 + offs_m[:, None],
-                mask=mask_m[:, None] & k_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
+            x_k = tl.trans(
+                tl.load(
+                    x_dm_ptr + k_range[:, None] * m64 + offs_m[None, :],
+                    mask=k_mask[:, None] & mask_m[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+            )
+            x_k = tl.where(k_mask[None, :], x_k, 0.0)
             gamma_out = tl.load(gamma_out_ptr + k_range, mask=k_mask, other=0.0).to(
                 tl.float32
             )
@@ -422,37 +584,24 @@ if _TRITON_AVAILABLE:
                 wp_ptr + offs_n[None, :] * ch64 + k_range[:, None],
                 mask=mask_n[None, :] & k_mask[:, None],
                 other=0.0,
-            ).to(tl.float32)
-            val_acc += _dot_f32(x_value, wp, GEMM_MODE)
+            )
+            val_acc = _mma(x_value, wp, val_acc, GEMM_MODE)
 
-        in_mean = tl.load(ln_stats_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)
-        in_rstd = tl.load(ln_stats_ptr + m64 + offs_m, mask=mask_m, other=0.0).to(
-            tl.float32
-        )
         gate_acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
         for k_off in range(0, CZ, TILE_K):
             k_range = k_off + offs_k
             k_mask = k_range < cz64
-            z_k = tl.load(
+            x_gate = tl.load(
                 x_in_ptr + offs_m[:, None] * cz64 + k_range[None, :],
                 mask=mask_m[:, None] & k_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
-            gamma_in = tl.load(gamma_in_ptr + k_range, mask=k_mask, other=0.0).to(
-                tl.float32
             )
-            x_gate = (z_k - in_mean[:, None]) * in_rstd[:, None] * gamma_in[None, :]
-            if HAS_LN_IN_BIAS:
-                beta_in = tl.load(beta_in_ptr + k_range, mask=k_mask, other=0.0).to(
-                    tl.float32
-                )
-                x_gate += tl.where(k_mask[None, :], beta_in[None, :], 0.0)
             wgate = tl.load(
                 wg_ptr + offs_n[None, :] * cz64 + k_range[:, None],
                 mask=mask_n[None, :] & k_mask[:, None],
                 other=0.0,
-            ).to(tl.float32)
-            gate_acc += _dot_f32(x_gate, wgate, GEMM_MODE)
+            )
+            gate_acc = _mma(x_gate, wgate, gate_acc, GEMM_MODE)
 
         out_val = tl.sigmoid(gate_acc) * val_acc
         if WITH_ADD:
@@ -468,19 +617,35 @@ if _TRITON_AVAILABLE:
             mask=mask_m[:, None] & mask_n[None, :],
         )
 
+    @triton.autotune(
+        configs=_ln_row_configs(_LN_ROW_TILES),
+        key=[],
+        restore_value=["y_ptr", "stats_ptr"],
+    )
     @triton.jit(
         do_not_specialize=["M", "eps"],
-        do_not_specialize_on_alignment=["x_ptr", "out_ptr"],
+        do_not_specialize_on_alignment=[
+            "x_ptr",
+            "w_ptr",
+            "b_ptr",
+            "y_ptr",
+            "stats_ptr",
+        ],
     )
-    def _ln_stats_kernel(
+    def _ln_fwd_kernel(
         x_ptr,
-        out_ptr,
+        w_ptr,
+        b_ptr,
+        y_ptr,
+        stats_ptr,
         M,
         D: tl.constexpr,
         eps,
+        HAS_BIAS: tl.constexpr,
         TILE_M: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
+        """Write LayerNorm ``y`` and ``[mean, rstd]`` in one pass."""
         pid = tl.program_id(0).to(tl.int64)
         m64 = tl.cast(M, tl.int64)
         offs_m = pid * TILE_M + tl.arange(0, TILE_M).to(tl.int64)
@@ -496,9 +661,24 @@ if _TRITON_AVAILABLE:
         mean = tl.sum(x, axis=1) / D
         x_c = tl.where(mask_d[None, :], x - mean[:, None], 0.0)
         rstd = 1.0 / tl.sqrt(tl.sum(x_c * x_c, axis=1) / D + eps)
-        tl.store(out_ptr + offs_m, mean, mask=mask_m)
-        tl.store(out_ptr + m64 + offs_m, rstd, mask=mask_m)
+        gamma = tl.load(w_ptr + offs_d, mask=mask_d, other=0.0).to(tl.float32)
+        y = x_c * rstd[:, None] * gamma[None, :]
+        if HAS_BIAS:
+            beta = tl.load(b_ptr + offs_d, mask=mask_d, other=0.0).to(tl.float32)
+            y = y + tl.where(mask_d[None, :], beta[None, :], 0.0)
+        tl.store(
+            y_ptr + offs_m[:, None] * D + offs_d[None, :],
+            y.to(y_ptr.dtype.element_ty),
+            mask=mask_m[:, None] & mask_d[None, :],
+        )
+        tl.store(stats_ptr + offs_m, mean, mask=mask_m)
+        tl.store(stats_ptr + m64 + offs_m, rstd, mask=mask_m)
 
+    @triton.autotune(
+        configs=_ln_row_configs(_LN_ROW_TILES),
+        key=[],
+        restore_value=["out_ptr"],
+    )
     @triton.jit(
         do_not_specialize=["M"],
         do_not_specialize_on_alignment=["x_ptr", "w_ptr", "b_ptr", "out_ptr"],
@@ -536,17 +716,20 @@ if _TRITON_AVAILABLE:
             mask=mask_m[:, None],
         )
 
+    @triton.autotune(
+        configs=_fwd_gemm_configs(),
+        key=["GEMM_MODE"],
+        prune_configs_by={"early_config_prune": _prune_fwd_gemm},
+        restore_value=["out_ptr"],
+    )
     @triton.jit(
-        do_not_specialize=["M", "eps"],
+        do_not_specialize=["M"],
         do_not_specialize_on_alignment=[
             "x_in_ptr",
             "x_out_ptr",
             "wg_ptr",
             "wp_ptr",
             "residual_ptr",
-            "gamma_ptr",
-            "beta_ptr",
-            "ln_stats_ptr",
             "out_ptr",
         ],
     )
@@ -556,16 +739,11 @@ if _TRITON_AVAILABLE:
         wg_ptr,
         wp_ptr,
         residual_ptr,
-        gamma_ptr,
-        beta_ptr,
-        ln_stats_ptr,
         out_ptr,
         M,
         CZ,
         CH,
-        eps,
         WITH_ADD: tl.constexpr,
-        HAS_LN_BIAS: tl.constexpr,
         GEMM_MODE: tl.constexpr,
         TILE_M: tl.constexpr,
         TILE_N: tl.constexpr,
@@ -590,38 +768,29 @@ if _TRITON_AVAILABLE:
                 x_out_ptr + offs_m[:, None] * ch64 + k_range[None, :],
                 mask=mask_m[:, None] & k_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+            )
             wp = tl.load(
                 wp_ptr + offs_n[None, :] * ch64 + k_range[:, None],
                 mask=mask_n[None, :] & k_mask[:, None],
                 other=0.0,
-            ).to(tl.float32)
-            val_acc += _dot_f32(xo, wp, GEMM_MODE)
+            )
+            val_acc = _mma(xo, wp, val_acc, GEMM_MODE)
 
-        mean = tl.load(ln_stats_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)
-        rstd = tl.load(ln_stats_ptr + m64 + offs_m, mask=mask_m, other=0.0).to(tl.float32)
         gate_acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
         for k_off in range(0, CZ, TILE_K):
             k_range = k_off + offs_k
             k_mask = k_range < cz64
-            z_k = tl.load(
+            xi = tl.load(
                 x_in_ptr + offs_m[:, None] * cz64 + k_range[None, :],
                 mask=mask_m[:, None] & k_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
-            gamma_k = tl.load(gamma_ptr + k_range, mask=k_mask, other=0.0).to(tl.float32)
-            xi = (z_k - mean[:, None]) * rstd[:, None] * gamma_k[None, :]
-            if HAS_LN_BIAS:
-                beta_k = tl.load(beta_ptr + k_range, mask=k_mask, other=0.0).to(
-                    tl.float32
-                )
-                xi = xi + tl.where(k_mask[None, :], beta_k[None, :], 0.0)
+            )
             wgate = tl.load(
                 wg_ptr + offs_n[None, :] * cz64 + k_range[:, None],
                 mask=mask_n[None, :] & k_mask[:, None],
                 other=0.0,
-            ).to(tl.float32)
-            gate_acc += _dot_f32(xi, wgate, GEMM_MODE)
+            )
+            gate_acc = _mma(xi, wgate, gate_acc, GEMM_MODE)
 
         out_val = tl.sigmoid(gate_acc) * val_acc
         if WITH_ADD:
@@ -637,6 +806,11 @@ if _TRITON_AVAILABLE:
             mask=mask_m[:, None] & mask_n[None, :],
         )
 
+    @triton.autotune(
+        configs=_ln_bwd_configs(),
+        key=[],
+        restore_value=["GX_ptr", "PGamma_ptr", "PBeta_ptr"],
+    )
     @triton.jit(
         do_not_specialize=["M"],
         do_not_specialize_on_alignment=[
@@ -700,6 +874,12 @@ if _TRITON_AVAILABLE:
         )
         tl.store(PBeta_ptr + pid * K + offs_k, tl.sum(dy, axis=0), mask=k_mask)
 
+    @triton.autotune(
+        configs=_bwd_gemm_configs(),
+        key=["GEMM_MODE"],
+        prune_configs_by={"early_config_prune": _prune_bwd_gemm},
+        restore_value=["PWp_ptr", "PWg_ptr"],
+    )
     @triton.jit(
         do_not_specialize=["M"],
         do_not_specialize_on_alignment=[
@@ -785,6 +965,12 @@ if _TRITON_AVAILABLE:
             mask=n_mask[:, None] & k_mask[None, :],
         )
 
+    @triton.autotune(
+        configs=_bwd_gemm_configs(),
+        key=["GEMM_MODE"],
+        prune_configs_by={"early_config_prune": _prune_bwd_gemm},
+        restore_value=["DX_ptr"],
+    )
     @triton.jit(
         do_not_specialize=["M"],
         do_not_specialize_on_alignment=[
@@ -866,8 +1052,14 @@ if _TRITON_AVAILABLE:
             mask=m_mask[:, None] & k_mask[None, :],
         )
 
+    @triton.autotune(
+        configs=_bwd_gemm_configs(),
+        key=["GEMM_MODE"],
+        prune_configs_by={"early_config_prune": _prune_bwd_gemm},
+        restore_value=["DX_ptr", "DZ_ptr", "PGamma_ptr", "PBeta_ptr"],
+    )
     @triton.jit(
-        do_not_specialize=["M"],
+        do_not_specialize=["M", "eps"],
         do_not_specialize_on_alignment=[
             "ZH_ptr",
             "X_ptr",
@@ -884,8 +1076,6 @@ if _TRITON_AVAILABLE:
         GO_ptr,
         Wz_ptr,
         Wg_ptr,
-        Mean_ptr,
-        Rstd_ptr,
         Gamma_ptr,
         Beta_ptr,
         DX_ptr,
@@ -893,6 +1083,7 @@ if _TRITON_AVAILABLE:
         PGamma_ptr,
         PBeta_ptr,
         M,
+        eps,
         CZ: tl.constexpr,
         CH: tl.constexpr,
         HAS_LN_BIAS: tl.constexpr,
@@ -905,6 +1096,7 @@ if _TRITON_AVAILABLE:
         pid = tl.program_id(0)
         offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_m64 = offs_m.to(tl.int64)
+        m64 = tl.cast(M, tl.int64)
         offs_cz = tl.arange(0, BLOCK_CZ)
         offs_ch = tl.arange(0, BLOCK_CH)
         m_mask = offs_m < M
@@ -915,15 +1107,20 @@ if _TRITON_AVAILABLE:
             mask=m_mask[:, None] & cz_mask[None, :],
             other=0.0,
         ).to(tl.float32)
-        x = tl.load(
-            X_ptr + offs_m64[:, None] * CH + offs_ch[None, :],
-            mask=m_mask[:, None] & ch_mask[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        mean = tl.load(Mean_ptr + offs_m, mask=m_mask, other=0.0)
-        rstd = tl.load(Rstd_ptr + offs_m, mask=m_mask, other=0.0)
+        # [C,M] is contiguous along M; load [BLOCK_CH, BLOCK_M] then transpose.
+        x = tl.trans(
+            tl.load(
+                X_ptr + offs_ch[:, None] * m64 + offs_m64[None, :],
+                mask=ch_mask[:, None] & m_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+        )
+        x = tl.where(ch_mask[None, :], x, 0.0)
+        mean = tl.sum(x, axis=1) / CH
+        x_norm = tl.where(ch_mask[None, :], x - mean[:, None], 0.0)
+        rstd = 1.0 / tl.sqrt(tl.sum(x_norm * x_norm, axis=1) / CH + eps)
+        x_norm = x_norm * rstd[:, None]
         gamma = tl.load(Gamma_ptr + offs_ch, mask=ch_mask, other=0.0).to(tl.float32)
-        x_norm = tl.where(ch_mask[None, :], (x - mean[:, None]) * rstd[:, None], 0.0)
         x_hat = x_norm * gamma[None, :]
         if HAS_LN_BIAS:
             beta = tl.load(Beta_ptr + offs_ch, mask=ch_mask, other=0.0).to(tl.float32)
@@ -961,9 +1158,9 @@ if _TRITON_AVAILABLE:
             dxh - grad_mean[:, None] - x_norm * grad_proj[:, None]
         )
         tl.store(
-            DX_ptr + offs_ch[None, :] * M + offs_m64[:, None],
-            dx.to(DX_ptr.dtype.element_ty),
-            mask=m_mask[:, None] & ch_mask[None, :],
+            DX_ptr + offs_ch[:, None] * m64 + offs_m64[None, :],
+            tl.trans(dx).to(DX_ptr.dtype.element_ty),
+            mask=ch_mask[:, None] & m_mask[None, :],
         )
         tl.store(
             DZ_ptr + offs_m64[:, None] * CZ + offs_cz[None, :],
@@ -977,8 +1174,14 @@ if _TRITON_AVAILABLE:
         )
         tl.store(PBeta_ptr + pid * CH + offs_ch, tl.sum(dx_hat, axis=0), mask=ch_mask)
 
+    @triton.autotune(
+        configs=_bwd_gemm_configs(),
+        key=["GEMM_MODE"],
+        prune_configs_by={"early_config_prune": _prune_bwd_gemm},
+        restore_value=["PWz_ptr", "PWg_ptr"],
+    )
     @triton.jit(
-        do_not_specialize=["M"],
+        do_not_specialize=["M", "eps"],
         do_not_specialize_on_alignment=[
             "ZH_ptr",
             "X_ptr",
@@ -995,13 +1198,12 @@ if _TRITON_AVAILABLE:
         GO_ptr,
         Wz_ptr,
         Wg_ptr,
-        Mean_ptr,
-        Rstd_ptr,
         Gamma_ptr,
         Beta_ptr,
         PWz_ptr,
         PWg_ptr,
         M,
+        eps,
         CZ: tl.constexpr,
         CH: tl.constexpr,
         HAS_LN_BIAS: tl.constexpr,
@@ -1040,6 +1242,7 @@ if _TRITON_AVAILABLE:
             mask=n_mask[:, None] & ch_mask[None, :],
             other=0.0,
         ).to(tl.float32)
+        m64 = tl.cast(M, tl.int64)
         for m0 in range(split_start, split_end, BLOCK_M):
             offs_m = m0 + tl.arange(0, BLOCK_M)
             offs_m64 = offs_m.to(tl.int64)
@@ -1049,14 +1252,18 @@ if _TRITON_AVAILABLE:
                 mask=m_mask[:, None] & cz_mask[None, :],
                 other=0.0,
             ).to(tl.float32)
-            x = tl.load(
-                X_ptr + offs_m64[:, None] * CH + offs_ch[None, :],
-                mask=m_mask[:, None] & ch_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            mean = tl.load(Mean_ptr + offs_m, mask=m_mask, other=0.0)
-            rstd = tl.load(Rstd_ptr + offs_m, mask=m_mask, other=0.0)
-            x_hat = (x - mean[:, None]) * rstd[:, None] * gamma[None, :]
+            x = tl.trans(
+                tl.load(
+                    X_ptr + offs_ch[:, None] * m64 + offs_m64[None, :],
+                    mask=ch_mask[:, None] & m_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+            )
+            x = tl.where(ch_mask[None, :], x, 0.0)
+            mean = tl.sum(x, axis=1) / CH
+            x_c = tl.where(ch_mask[None, :], x - mean[:, None], 0.0)
+            rstd = 1.0 / tl.sqrt(tl.sum(x_c * x_c, axis=1) / CH + eps)
+            x_hat = x_c * rstd[:, None] * gamma[None, :]
             if HAS_LN_BIAS:
                 x_hat = x_hat + tl.where(ch_mask[None, :], beta[None, :], 0.0)
             go = tl.load(
@@ -1082,6 +1289,11 @@ if _TRITON_AVAILABLE:
         )
 
 
+    @triton.autotune(
+        configs=_ln_bwd_configs(),
+        key=[],
+        restore_value=["Y_ptr"],
+    )
     @triton.jit(
         do_not_specialize=["M"],
         do_not_specialize_on_alignment=["X_ptr", "Y_ptr"],
@@ -1205,7 +1417,7 @@ else:  # pragma: no cover
 
     _gated_dual_gemm_kernel = _unavailable
     _gated_out_from_dm_kernel = _unavailable
-    _ln_stats_kernel = _unavailable
+    _ln_fwd_kernel = _unavailable
     _ln_transpose_kernel = _unavailable
     _gated_out_gemm_residual_kernel = _unavailable
     _ln_bwd_kernel = _unavailable
@@ -1229,72 +1441,110 @@ def _next_power_of_two(n: int) -> int:
     return 1 if n <= 1 else 1 << (n - 1).bit_length()
 
 
-def _dual_cfg(nproj: int) -> dict:
-    return _DUAL_GEMM_CFG_N64 if nproj < 128 else _DUAL_GEMM_CFG
-
-
-def ln_stats(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
-    """Return per-row LayerNorm mean/rstd as float32 ``[2, M]``."""
+def ln_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float = 1e-5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """LayerNorm ``y`` plus float32 ``[mean, rstd]``. ``y`` matches ``x.dtype``."""
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton is required for fused_trimul")
-    m, d = x.shape
     x = x.contiguous()
-    out = torch.empty((2, m), device=x.device, dtype=torch.float32)
-    _ln_stats_kernel[(triton.cdiv(m, _LN_STATS_TILE_M),)](
+    m, d = x.shape
+    y = torch.empty_like(x)
+    stats = torch.empty((2, m), device=x.device, dtype=torch.float32)
+    dummy = x
+    _ln_fwd_kernel[(lambda meta: (triton.cdiv(m, meta["TILE_M"]),))](
         x,
-        out,
+        weight.contiguous(),
+        bias.contiguous() if bias is not None else dummy,
+        y,
+        stats,
         m,
         D=d,
         eps=float(eps),
-        TILE_M=_LN_STATS_TILE_M,
+        HAS_BIAS=bias is not None,
         BLOCK_D=_next_power_of_two(d),
-        num_warps=8,
-        num_stages=2,
     )
-    return out
+    return y, stats
 
 
-def gated_dual_gemm(
-    x: torch.Tensor,
+_dual_autotune_ready: set[tuple] = set()
+
+
+def _ensure_dual_autotune(
+    sample: torch.Tensor,
     wp: torch.Tensor,
-    wg: torch.Tensor,
-    mask: torch.Tensor | None,
-    ln_weight: torch.Tensor,
-    ln_bias: torch.Tensor | None,
-    ln_stats_t: torch.Tensor,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    """``sigmoid(LN(x)@wg^T) * (LN(x)@wp^T) * mask`` as ``[Nproj, M]``."""
-    if not _TRITON_AVAILABLE:
-        raise RuntimeError("Triton is required for fused_trimul")
-    m, k = x.shape
-    nproj = wp.shape[0]
-    x = x.contiguous()
-    out = torch.empty((nproj, m), device=x.device, dtype=x.dtype)
-    dummy = x
-    cfg = _dual_cfg(nproj)
+    nproj: int,
+    k: int,
+    mode: str,
+) -> None:
+    """Time dual-gemm on a large dummy grid so a small first ``M`` cannot lock tiles."""
+    key = (mode, sample.device.type, sample.device.index, nproj, k, sample.dtype)
+    if key in _dual_autotune_ready:
+        return
+    m = _DUAL_WARM_M
+    dummy_x = torch.empty((m, k), device=sample.device, dtype=sample.dtype)
+    dummy_out = torch.empty((nproj, m), device=sample.device, dtype=sample.dtype)
 
     def grid(meta):
         return (triton.cdiv(m, meta["TILE_M"]), triton.cdiv(nproj, meta["TILE_N"]))
 
     _gated_dual_gemm_kernel[grid](
-        x,
-        wp.contiguous(),
-        wg.contiguous(),
+        dummy_x,
+        wp,
+        wp,
+        dummy_x,
+        dummy_out,
+        m,
+        nproj,
+        k,
+        HAS_MASK=False,
+        GEMM_MODE=mode,
+    )
+    _dual_autotune_ready.add(key)
+
+
+def gated_dual_gemm(
+    x_hat: torch.Tensor,
+    wp: torch.Tensor,
+    wg: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """``sigmoid(x_hat@wg^T) * (x_hat@wp^T) * mask`` as ``[Nproj, M]``.
+
+    ``x_hat`` is already LayerNorm'd. bf16 activations downcast masters once.
+    """
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("Triton is required for fused_trimul")
+    m, k = x_hat.shape
+    nproj = wp.shape[0]
+    x_hat = x_hat.contiguous()
+    wp, wg = _downcast_masters(x_hat.dtype, wp.contiguous(), wg.contiguous())
+    out = torch.empty((nproj, m), device=x_hat.device, dtype=x_hat.dtype)
+    dummy = x_hat
+    mode = _gemm_mode(x_hat)
+    key = (mode, x_hat.device.type, x_hat.device.index, nproj, k, x_hat.dtype)
+    if key not in _dual_autotune_ready and m < _DUAL_WARM_M:
+        _ensure_dual_autotune(x_hat, wp, nproj, k, mode)
+
+    def grid(meta):
+        return (triton.cdiv(m, meta["TILE_M"]), triton.cdiv(nproj, meta["TILE_N"]))
+
+    _gated_dual_gemm_kernel[grid](
+        x_hat,
+        wp,
+        wg,
         mask.contiguous().view(-1) if mask is not None else dummy,
-        ln_weight.contiguous(),
-        ln_bias.contiguous() if ln_bias is not None else dummy,
-        ln_stats_t.contiguous(),
         out,
         m,
         nproj,
         k,
-        float(eps),
         HAS_MASK=mask is not None,
-        HAS_LN_BIAS=ln_bias is not None,
-        GEMM_MODE=_gemm_mode(x),
-        **cfg,
+        GEMM_MODE=mode,
     )
+    _dual_autotune_ready.add(key)
     return out
 
 
@@ -1310,7 +1560,7 @@ def ln_transpose(
     d, m = x_dm.shape
     out = torch.empty((m, d), device=x_dm.device, dtype=x_dm.dtype)
     dummy = x_dm
-    _ln_transpose_kernel[(triton.cdiv(m, _LN_TRANSPOSE_TILE_M),)](
+    _ln_transpose_kernel[(lambda meta: (triton.cdiv(m, meta["TILE_M"]),))](
         x_dm.contiguous(),
         weight.contiguous(),
         bias.contiguous() if bias is not None else dummy,
@@ -1319,111 +1569,88 @@ def ln_transpose(
         D=d,
         EPS=float(eps),
         HAS_BIAS=bias is not None,
-        TILE_M=_LN_TRANSPOSE_TILE_M,
-        num_warps=8,
-        num_stages=2,
     )
     return out
 
 
 def gated_out_gemm_residual(
-    x_in: torch.Tensor,
+    x_hat: torch.Tensor,
     x_out: torch.Tensor,
     wg: torch.Tensor,
     wp: torch.Tensor,
     residual: torch.Tensor | None,
-    ln_weight: torch.Tensor,
-    ln_bias: torch.Tensor | None,
-    ln_stats_t: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton is required for fused_trimul")
-    m, cz = x_in.shape
+    m, cz = x_hat.shape
     ch = x_out.shape[1]
     if out is None:
-        out = torch.empty((m, cz), device=x_in.device, dtype=x_in.dtype)
-    dummy = x_in
+        out = torch.empty((m, cz), device=x_hat.device, dtype=x_hat.dtype)
+    dummy = x_hat
+    wg, wp = _downcast_masters(x_hat.dtype, wg.contiguous(), wp.contiguous())
 
     def grid(meta):
         return (triton.cdiv(m, meta["TILE_M"]), triton.cdiv(cz, meta["TILE_N"]))
 
     _gated_out_gemm_residual_kernel[grid](
-        x_in.contiguous(),
+        x_hat.contiguous(),
         x_out.contiguous(),
-        wg.contiguous(),
-        wp.contiguous(),
+        wg,
+        wp,
         residual.contiguous() if residual is not None else dummy,
-        ln_weight.contiguous(),
-        ln_bias.contiguous() if ln_bias is not None else dummy,
-        ln_stats_t.contiguous(),
         out,
         m,
         cz,
         ch,
-        1e-5,
         WITH_ADD=residual is not None,
-        HAS_LN_BIAS=ln_bias is not None,
-        GEMM_MODE=_gemm_mode(x_in),
-        **_OUT_GEMM_CFG,
+        GEMM_MODE=_gemm_mode(x_hat),
     )
     return out
 
 
 def gated_out_from_dm(
-    x_in: torch.Tensor,
+    x_hat: torch.Tensor,
     x_dm: torch.Tensor,
     wg: torch.Tensor,
     wp: torch.Tensor,
     residual: torch.Tensor | None,
-    ln_in_w: torch.Tensor,
-    ln_in_b: torch.Tensor | None,
-    ln_stats_t: torch.Tensor,
     ln_out_w: torch.Tensor,
     ln_out_b: torch.Tensor | None,
     *,
     ln_out_eps: float = 1e-5,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Fuse LN_out on D-major contraction output with gated output projection."""
-    m, cz = x_in.shape
+    """Fuse LN_out on D-major contraction output with gated output projection.
+
+    ``x_hat`` is already LN_in; the gate GEMM is a clean MMA.
+    """
+    m, cz = x_hat.shape
     ch, x_m = x_dm.shape
     if x_m != m:
         raise ValueError(f"x_dm has M={x_m}, expected {m}")
     if ch < 128:
         x_out = ln_transpose(x_dm, ln_out_w, ln_out_b, eps=ln_out_eps)
         return gated_out_gemm_residual(
-            x_in,
-            x_out,
-            wg,
-            wp,
-            residual,
-            ln_in_w,
-            ln_in_b,
-            ln_stats_t,
-            out=out,
+            x_hat, x_out, wg, wp, residual, out=out
         )
-    if out is None:
-        out = torch.empty((m, cz), device=x_in.device, dtype=x_in.dtype)
-    dummy = x_in
     if cz > 128 or ch > 128:
         raise ValueError("fused D-major output supports CZ/CH <= 128")
-    if out.data_ptr() == x_in.data_ptr() and _OUT_DM_CFG["TILE_N"] < cz:
-        raise ValueError("in-place D-major output requires one channel tile")
-    grid = (
-        triton.cdiv(m, _OUT_DM_CFG["TILE_M"]),
-        triton.cdiv(cz, _OUT_DM_CFG["TILE_N"]),
-    )
+    if out is None:
+        out = torch.empty((m, cz), device=x_hat.device, dtype=x_hat.dtype)
+    dummy = x_hat
+    wg, wp = _downcast_masters(x_hat.dtype, wg.contiguous(), wp.contiguous())
+
+    def grid(meta):
+        return (triton.cdiv(m, meta["TILE_M"]), triton.cdiv(cz, meta["TILE_N"]))
+
     _gated_out_from_dm_kernel[grid](
-        x_in.contiguous(),
+        x_hat.contiguous(),
         x_dm.contiguous(),
-        wg.contiguous(),
-        wp.contiguous(),
+        wg,
+        wp,
         residual.contiguous() if residual is not None else dummy,
-        ln_in_w.contiguous(),
-        ln_in_b.contiguous() if ln_in_b is not None else dummy,
-        ln_stats_t.contiguous(),
         ln_out_w.contiguous(),
         ln_out_b.contiguous() if ln_out_b is not None else dummy,
         out,
@@ -1432,10 +1659,8 @@ def gated_out_from_dm(
         ch,
         float(ln_out_eps),
         WITH_ADD=residual is not None,
-        HAS_LN_IN_BIAS=ln_in_b is not None,
         HAS_LN_OUT_BIAS=ln_out_b is not None,
-        GEMM_MODE=_gemm_mode(x_in),
-        **_OUT_DM_CFG,
+        GEMM_MODE=_gemm_mode(x_hat),
     )
     return out
 
@@ -1449,6 +1674,7 @@ def _contract(a: torch.Tensor, b: torch.Tensor, outgoing: bool) -> torch.Tensor:
 
 def _trimul_whole(
     z: torch.Tensor,
+    z_hat: torch.Tensor,
     mask_flat: torch.Tensor,
     stats: torch.Tensor,
     wa_p: torch.Tensor,
@@ -1457,26 +1683,20 @@ def _trimul_whole(
     wb_g: torch.Tensor,
     wz: torch.Tensor,
     wg: torch.Tensor,
-    ln_in_w: torch.Tensor,
-    ln_in_b: torch.Tensor | None,
     ln_out_w: torch.Tensor,
     ln_out_b: torch.Tensor | None,
     *,
     outgoing: bool,
     residual: torch.Tensor | None,
-    ln_in_eps: float,
     ln_out_eps: float,
     out: torch.Tensor | None,
     return_acts: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, n, _, c_z = z.shape
     c_hidden = wa_p.shape[0]
-    z_2d = z.reshape(-1, c_z)
     wp_ab = torch.cat([wa_p, wb_p], dim=0)
     wg_ab = torch.cat([wa_g, wb_g], dim=0)
-    ab = gated_dual_gemm(
-        z_2d, wp_ab, wg_ab, mask_flat, ln_in_w, ln_in_b, stats, eps=ln_in_eps
-    )
+    ab = gated_dual_gemm(z_hat, wp_ab, wg_ab, mask_flat)
     a = ab[:c_hidden].view(c_hidden, batch, n, n)
     b = ab[c_hidden:].view(c_hidden, batch, n, n)
     x = _contract(a, b, outgoing)
@@ -1484,14 +1704,11 @@ def _trimul_whole(
         del a, b, ab
     x_dm = x.reshape(c_hidden, batch * n * n)
     out_2d = gated_out_from_dm(
-        z_2d,
+        z_hat,
         x_dm,
         wg,
         wz,
         residual.reshape(-1, c_z) if residual is not None else None,
-        ln_in_w,
-        ln_in_b,
-        stats,
         ln_out_w,
         ln_out_b,
         ln_out_eps=ln_out_eps,
@@ -1505,17 +1722,14 @@ def _trimul_whole(
 
 
 def _trimul_chunked_outgoing(
-    z_2d: torch.Tensor,
+    z_hat: torch.Tensor,
     mask_flat: torch.Tensor,
-    stats: torch.Tensor,
     wa_p: torch.Tensor,
     wa_g: torch.Tensor,
     wb_p: torch.Tensor,
     wb_g: torch.Tensor,
     wz: torch.Tensor,
     wg: torch.Tensor,
-    ln_in_w: torch.Tensor,
-    ln_in_b: torch.Tensor | None,
     ln_out_w: torch.Tensor,
     ln_out_b: torch.Tensor | None,
     *,
@@ -1523,45 +1737,30 @@ def _trimul_chunked_outgoing(
     c_z: int,
     c_hidden: int,
     residual: torch.Tensor | None,
-    ln_in_eps: float,
     ln_out_eps: float,
     out: torch.Tensor | None,
     chunk_cap: int,
 ) -> torch.Tensor:
     m = n * n
-    b_full = gated_dual_gemm(
-        z_2d, wb_p, wb_g, mask_flat, ln_in_w, ln_in_b, stats, eps=ln_in_eps
-    )
+    b_full = gated_dual_gemm(z_hat, wb_p, wb_g, mask_flat)
     b_4d = b_full.view(c_hidden, 1, n, n)
     out_2d = out.reshape(m, c_z) if out is not None else torch.empty(
-        (m, c_z), device=z_2d.device, dtype=z_2d.dtype
+        (m, c_z), device=z_hat.device, dtype=z_hat.dtype
     )
     resid_2d = residual.reshape(m, c_z) if residual is not None else None
     for i_start in range(0, n, chunk_cap):
         i_end = min(n, i_start + chunk_cap)
         rows = i_end - i_start
         m0, m1 = i_start * n, i_end * n
-        a_c = gated_dual_gemm(
-            z_2d[m0:m1],
-            wa_p,
-            wa_g,
-            mask_flat[m0:m1],
-            ln_in_w,
-            ln_in_b,
-            stats[:, m0:m1].contiguous(),
-            eps=ln_in_eps,
-        )
+        a_c = gated_dual_gemm(z_hat[m0:m1], wa_p, wa_g, mask_flat[m0:m1])
         x_c = _contract(a_c.view(c_hidden, 1, rows, n), b_4d, outgoing=True)
         del a_c
         gated_out_from_dm(
-            z_2d[m0:m1],
+            z_hat[m0:m1],
             x_c.reshape(c_hidden, rows * n),
             wg,
             wz,
             resid_2d[m0:m1] if resid_2d is not None else None,
-            ln_in_w,
-            ln_in_b,
-            stats[:, m0:m1].contiguous(),
             ln_out_w,
             ln_out_b,
             ln_out_eps=ln_out_eps,
@@ -1572,17 +1771,14 @@ def _trimul_chunked_outgoing(
 
 
 def _trimul_chunked_incoming(
-    z_2d: torch.Tensor,
+    z_hat: torch.Tensor,
     mask_flat: torch.Tensor,
-    stats: torch.Tensor,
     wa_p: torch.Tensor,
     wa_g: torch.Tensor,
     wb_p: torch.Tensor,
     wb_g: torch.Tensor,
     wz: torch.Tensor,
     wg: torch.Tensor,
-    ln_in_w: torch.Tensor,
-    ln_in_b: torch.Tensor | None,
     ln_out_w: torch.Tensor,
     ln_out_b: torch.Tensor | None,
     *,
@@ -1590,7 +1786,6 @@ def _trimul_chunked_incoming(
     c_z: int,
     c_hidden: int,
     residual: torch.Tensor | None,
-    ln_in_eps: float,
     ln_out_eps: float,
     out: torch.Tensor | None,
     chunk_cap: int,
@@ -1598,7 +1793,7 @@ def _trimul_chunked_incoming(
     m = n * n
     group_size = min(64, c_hidden)
     grouped_k_cap = min(n, chunk_cap * c_hidden // group_size)
-    x_accum = torch.empty((c_hidden, n, n), device=z_2d.device, dtype=z_2d.dtype)
+    x_accum = torch.empty((c_hidden, n, n), device=z_hat.device, dtype=z_hat.dtype)
     for c_start in range(0, c_hidden, group_size):
         c_end = min(c_hidden, c_start + group_size)
         channels = c_end - c_start
@@ -1610,16 +1805,7 @@ def _trimul_chunked_incoming(
             k_end = min(n, k_start + grouped_k_cap)
             k_rows = k_end - k_start
             m0, m1 = k_start * n, k_end * n
-            ab_k = gated_dual_gemm(
-                z_2d[m0:m1],
-                wp_ab,
-                wg_ab,
-                mask_flat[m0:m1],
-                ln_in_w,
-                ln_in_b,
-                stats[:, m0:m1].contiguous(),
-                eps=ln_in_eps,
-            )
+            ab_k = gated_dual_gemm(z_hat[m0:m1], wp_ab, wg_ab, mask_flat[m0:m1])
             a_k = ab_k[:channels].view(channels, k_rows, n)
             b_k = ab_k[channels:].view(channels, k_rows, n)
             with torch.amp.autocast(device_type="cuda", enabled=False):
@@ -1631,7 +1817,7 @@ def _trimul_chunked_incoming(
             del ab_k, a_k, b_k
 
     out_2d = out.reshape(m, c_z) if out is not None else torch.empty(
-        (m, c_z), device=z_2d.device, dtype=z_2d.dtype
+        (m, c_z), device=z_hat.device, dtype=z_hat.dtype
     )
     resid_2d = residual.reshape(m, c_z) if residual is not None else None
     for i_start in range(0, n, chunk_cap):
@@ -1640,14 +1826,11 @@ def _trimul_chunked_incoming(
         m0, m1 = i_start * n, i_end * n
         x_dm = x_accum[:, i_start:i_end, :].reshape(c_hidden, rows * n).contiguous()
         gated_out_from_dm(
-            z_2d[m0:m1],
+            z_hat[m0:m1],
             x_dm,
             wg,
             wz,
             resid_2d[m0:m1] if resid_2d is not None else None,
-            ln_in_w,
-            ln_in_b,
-            stats[:, m0:m1].contiguous(),
             ln_out_w,
             ln_out_b,
             ln_out_eps=ln_out_eps,
@@ -1686,7 +1869,7 @@ def _launch_fused_trimul(
         if mask is not None
         else z_c.new_ones(z_2d.shape[0])
     )
-    stats = ln_stats(z_2d, ln_in_eps)
+    z_hat, stats = ln_fwd(z_2d, ln_in_w, ln_in_b, ln_in_eps)
     inplace = (
         residual is not None
         and residual.data_ptr() == z_c.data_ptr()
@@ -1697,7 +1880,6 @@ def _launch_fused_trimul(
     kwargs = dict(
         outgoing=outgoing,
         residual=resid,
-        ln_in_eps=ln_in_eps,
         ln_out_eps=ln_out_eps,
         out=out,
     )
@@ -1707,7 +1889,6 @@ def _launch_fused_trimul(
             c_z=c_z,
             c_hidden=c_hidden,
             residual=resid,
-            ln_in_eps=ln_in_eps,
             ln_out_eps=ln_out_eps,
             out=out,
             chunk_cap=chunk_cap,
@@ -1716,39 +1897,34 @@ def _launch_fused_trimul(
             raise RuntimeError("fused_trimul training acts are not used with chunk_cap")
         if outgoing:
             return _trimul_chunked_outgoing(
-                z_2d,
+                z_hat,
                 mask_flat,
-                stats,
                 wa_p,
                 wa_g,
                 wb_p,
                 wb_g,
                 wz,
                 wg,
-                ln_in_w,
-                ln_in_b,
                 ln_out_w,
                 ln_out_b,
                 **chunk_kwargs,
             )
         return _trimul_chunked_incoming(
-            z_2d,
+            z_hat,
             mask_flat,
-            stats,
             wa_p,
             wa_g,
             wb_p,
             wb_g,
             wz,
             wg,
-            ln_in_w,
-            ln_in_b,
             ln_out_w,
             ln_out_b,
             **chunk_kwargs,
         )
     return _trimul_whole(
         z_c,
+        z_hat,
         mask_flat,
         stats,
         wa_p,
@@ -1757,16 +1933,11 @@ def _launch_fused_trimul(
         wb_g,
         wz,
         wg,
-        ln_in_w,
-        ln_in_b,
         ln_out_w,
         ln_out_b,
         return_acts=return_acts,
         **kwargs,
     )
-
-
-_BWD_TILE = dict(BLOCK_M=32, BLOCK_N=32, num_warps=4, num_stages=1)
 
 
 def _ln_bwd(x, dy, mean, rstd, gamma, has_beta: bool, *, out=None):
@@ -1782,10 +1953,11 @@ def _ln_bwd(x, dy, mean, rstd, gamma, has_beta: bool, *, out=None):
         gx = out
     else:
         gx = torch.empty_like(x_c)
-    n_partial = triton.cdiv(m, 16)
-    partial_g = torch.empty((n_partial, k), dtype=torch.float32, device=x.device)
-    partial_b = torch.empty_like(partial_g)
-    _ln_bwd_kernel[(n_partial,)](
+    # Zero so unused rows stay valid if autotune picks BLOCK_M > min.
+    n_partial = triton.cdiv(m, _BWD_MIN_BLOCK_M)
+    partial_g = torch.zeros((n_partial, k), dtype=torch.float32, device=x.device)
+    partial_b = torch.zeros_like(partial_g)
+    _ln_bwd_kernel[(lambda meta: (triton.cdiv(m, meta["BLOCK_M"]),))](
         x_c,
         dy_c,
         mean,
@@ -1799,9 +1971,7 @@ def _ln_bwd(x, dy, mean, rstd, gamma, has_beta: bool, *, out=None):
         gx.stride(0),
         m,
         K=k,
-        BLOCK_M=16,
         BLOCK_K=max(_next_power_of_two(k), 16),
-        num_warps=4,
     )
     d_gamma = partial_g.sum(0)
     d_beta = partial_b.sum(0) if has_beta else None
@@ -1816,7 +1986,11 @@ def _gated_dw(x, go, wp, wg, mask):
     dummy = x_c
     p_wp = torch.empty((_BWD_SPLIT_M, n, k), dtype=torch.float32, device=x.device)
     p_wg = torch.empty_like(p_wp)
-    _gated_dw_kernel[(_BWD_SPLIT_M, triton.cdiv(n, _BWD_TILE["BLOCK_N"]))](
+
+    def grid(meta):
+        return (_BWD_SPLIT_M, triton.cdiv(n, meta["BLOCK_N"]))
+
+    _gated_dw_kernel[grid](
         x_c,
         go_c,
         wp.contiguous(),
@@ -1831,7 +2005,6 @@ def _gated_dw(x, go, wp, wg, mask):
         GEMM_MODE=_gemm_mode(x_c),
         SPLIT_M=_BWD_SPLIT_M,
         BLOCK_K=max(_next_power_of_two(k), 16),
-        **_BWD_TILE,
     )
     return p_wp.sum(0), p_wg.sum(0)
 
@@ -1847,7 +2020,7 @@ def _gated_dx(x, go, wp, wg, mask, dx=None):
         dx = torch.empty((x_c.shape[0], k), dtype=x_c.dtype, device=x.device)
     elif not dx.is_contiguous():
         dx = dx.contiguous()
-    _gated_dx_kernel[(triton.cdiv(x_c.shape[0], _BWD_TILE["BLOCK_M"]),)](
+    _gated_dx_kernel[(lambda meta: (triton.cdiv(x_c.shape[0], meta["BLOCK_M"]),))](
         x_c,
         go_c,
         wp.contiguous(),
@@ -1861,61 +2034,60 @@ def _gated_dx(x, go, wp, wg, mask, dx=None):
         ACCUM=accum,
         GEMM_MODE=_gemm_mode(x_c),
         BLOCK_K=max(_next_power_of_two(k), 16),
-        **_BWD_TILE,
     )
     return dx
 
 
-def _gated_out_bwd(z_hat, x_md, go, wz, wg, mean_out, rstd_out, ln_out_w, ln_out_b):
-    """Output-gate backward. Does not store g / val / x_hat."""
+def _gated_out_bwd(z_hat, x_ch, go, wz, wg, ln_out_w, ln_out_b, eps: float = 1e-5):
+    """Output-gate backward. ``x_ch`` is ``[C, M]``; no stored g / val / x_hat."""
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton is required for fused_trimul")
-    z_c, x_c, go_c = z_hat.contiguous(), x_md.contiguous(), go.contiguous()
+    z_c, x_c, go_c = z_hat.contiguous(), x_ch.contiguous(), go.contiguous()
     m, cz = z_c.shape
-    ch = x_c.shape[1]
+    ch = x_c.shape[0]
+    if x_c.shape[1] != m:
+        raise ValueError(f"x_ch has M={x_c.shape[1]}, expected {m}")
     dummy = z_c
     d_x = torch.empty((ch, m), device=z_c.device, dtype=x_c.dtype)
     d_z_hat = torch.empty_like(z_c)
     p_wz = torch.empty((_BWD_SPLIT_M, cz, ch), dtype=torch.float32, device=z_c.device)
     p_wg = torch.empty((_BWD_SPLIT_M, cz, cz), dtype=torch.float32, device=z_c.device)
-    n_partial = triton.cdiv(m, _BWD_TILE["BLOCK_M"])
-    p_gamma = torch.empty((n_partial, ch), dtype=torch.float32, device=z_c.device)
-    p_beta = torch.empty_like(p_gamma)
-    cfg = dict(
+    n_partial = triton.cdiv(m, _BWD_MIN_BLOCK_M)
+    p_gamma = torch.zeros((n_partial, ch), dtype=torch.float32, device=z_c.device)
+    p_beta = torch.zeros_like(p_gamma)
+    shared = dict(
         CZ=cz,
         CH=ch,
         HAS_LN_BIAS=ln_out_b is not None,
         GEMM_MODE=_gemm_mode(z_c),
         BLOCK_CZ=max(_next_power_of_two(cz), 16),
         BLOCK_CH=max(_next_power_of_two(ch), 16),
-        **_BWD_TILE,
     )
-    _gated_out_bwd_dw_kernel[
-        (_BWD_SPLIT_M, triton.cdiv(cz, _BWD_TILE["BLOCK_N"]))
-    ](
+
+    def dw_grid(meta):
+        return (_BWD_SPLIT_M, triton.cdiv(cz, meta["BLOCK_N"]))
+
+    _gated_out_bwd_dw_kernel[dw_grid](
         z_c,
         x_c,
         go_c,
         wz.contiguous(),
         wg.contiguous(),
-        mean_out,
-        rstd_out,
         ln_out_w.contiguous(),
         ln_out_b.contiguous() if ln_out_b is not None else dummy,
         p_wz,
         p_wg,
         m,
+        float(eps),
         SPLIT_M=_BWD_SPLIT_M,
-        **cfg,
+        **shared,
     )
-    _gated_out_bwd_dx_kernel[(n_partial,)](
+    _gated_out_bwd_dx_kernel[(lambda meta: (triton.cdiv(m, meta["BLOCK_M"]),))](
         z_c,
         x_c,
         go_c,
         wz.contiguous(),
         wg.contiguous(),
-        mean_out,
-        rstd_out,
         ln_out_w.contiguous(),
         ln_out_b.contiguous() if ln_out_b is not None else dummy,
         d_x,
@@ -1923,7 +2095,8 @@ def _gated_out_bwd(z_hat, x_md, go, wz, wg, mean_out, rstd_out, ln_out_w, ln_out
         p_gamma,
         p_beta,
         m,
-        **cfg,
+        float(eps),
+        **shared,
     )
     d_wz = p_wz.sum(0)
     d_wg = p_wg.sum(0)
@@ -1945,7 +2118,7 @@ def _ln_apply(x, mean, rstd, gamma, beta, out=None):
     if out is None:
         out = torch.empty_like(x_c)
     dummy = x_c
-    _ln_apply_kernel[(triton.cdiv(x_c.shape[0], 16),)](
+    _ln_apply_kernel[(lambda meta: (triton.cdiv(x_c.shape[0], meta["BLOCK_M"]),))](
         x_c,
         mean,
         rstd,
@@ -1957,9 +2130,7 @@ def _ln_apply(x, mean, rstd, gamma, beta, out=None):
         x_c.shape[0],
         K=x_c.shape[1],
         HAS_BIAS=beta is not None,
-        BLOCK_M=16,
         BLOCK_K=max(_next_power_of_two(x_c.shape[1]), 16),
-        num_warps=4,
     )
     return out
 
@@ -2091,16 +2262,11 @@ def _fused_trimul_backward(
     z_hat = _ln_apply(z_2d, mean_in, rstd_in, ln_in_w, ln_in_b)
     a = ab[:c_h].view(c_h, batch, n, n)
     b = ab[c_h:].view(c_h, batch, n, n)
-    # LN / output-gate need MD; this is the only CH→MD copy in backward.
-    x_md = x_ch.permute(1, 2, 3, 0).contiguous().view(-1, c_h)
-    del x_ch
-    stats_out = ln_stats(x_md, ln_out_eps)
-    mean_out, rstd_out = stats_out[0], stats_out[1]
-
+    x_cm = x_ch.reshape(c_h, -1)
     d_x_cm, d_z_hat, d_wz, d_wg, d_ln_out_w, d_ln_out_b = _gated_out_bwd(
-        z_hat, x_md, go_2d, wz, wg, mean_out, rstd_out, ln_out_w, ln_out_b
+        z_hat, x_cm, go_2d, wz, wg, ln_out_w, ln_out_b, ln_out_eps
     )
-    del x_md, stats_out, mean_out, rstd_out
+    del x_ch, x_cm
 
     d_x_ch = d_x_cm.view(c_h, batch, n, n)
     del d_x_cm

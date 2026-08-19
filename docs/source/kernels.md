@@ -144,7 +144,9 @@ On CUDA with a contiguous `[1, N, N, C]` activation, `float32` or `bfloat16` act
 
 - `ieee` — fp32 activations and `torch.backends.cuda.matmul.allow_tf32` off
 - `tf32` — fp32 activations and `allow_tf32` on
-- `bf16` — bf16 activations with fp32 masters (tiles downcast for the GEMM, accumulate in fp32)
+- `bf16` — bf16 activations with fp32 masters (downcast once before the MMA, accumulate in fp32)
+
+Forward writes LN_in once, then dual-gemm and the output-gate GEMMs are clean MMAs (no in-loop LN or per-tile master convert). GEMM tiles autotune on ``GEMM_MODE`` only; LN tiles autotune on an empty key. Dual-gemm warms that cache on a large dummy grid so a small first ``M`` cannot lock the winner. Sequence length is not an autotune key.
 
 ```bash
 # Default: use Triton when eligible
