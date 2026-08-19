@@ -131,3 +131,25 @@ OPENFOLD3_FUSED_LN_LINEAR=1
 # Force eager LN + Linear (and the chunked _embed_zij fallback)
 OPENFOLD3_FUSED_LN_LINEAR=0
 ```
+
+# Fused triangle multiplicative update
+
+`TriangleMultiplicationOutgoing` / `Incoming` can fuse LN_in → gated A/B projections → triangle einsum → LN_out → gated output [+ residual] as length-generic Triton kernels instead of the eager pair-stack primitives (or cuEq). Sequence length is not a specialize key. Under the 2a `OPENFOLD3_TRIMUL_CHUNK_CAP` memory profile the same kernels run an I-row / grouped-K schedule so the cap stays the memory bound.
+
+In-place `z + update` writes are inference-only when `residual` is `z`. Training keeps A/B/X from the forward (non-reentrant checkpoint packs the first-forward copies so they do not stack across pair blocks). The output-gate backward fuses LN_out, the gated Linear, and exclusive split-M `dW` so `g` / `val` / `x_hat` are never stored; A-side and B-side `dW`/`dX` run sequentially. Ineligible shapes (bf16 weights, `c > 128`, too few rows, linear bias) keep the eager module.
+
+## Triton kernel
+
+On CUDA with a contiguous `[1, N, N, C]` activation, `float32` or `bfloat16` activations, fp32 Parameter masters, `C_z, C_hidden ≤ 128`, and at least 4096 pair rows, the fused path uses one `GEMM_MODE` for every `tl.dot`:
+
+- `ieee` — fp32 activations and `torch.backends.cuda.matmul.allow_tf32` off
+- `tf32` — fp32 activations and `allow_tf32` on
+- `bf16` — bf16 activations with fp32 masters (tiles downcast for the GEMM, accumulate in fp32)
+
+```bash
+# Default: use Triton when eligible
+OPENFOLD3_FUSED_TRIMUL=1
+
+# Force eager / cuEq / chunked inference trimul
+OPENFOLD3_FUSED_TRIMUL=0
+```
