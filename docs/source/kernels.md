@@ -155,3 +155,27 @@ OPENFOLD3_FUSED_TRIMUL=1
 # Force eager / cuEq / chunked inference trimul
 OPENFOLD3_FUSED_TRIMUL=0
 ```
+
+# Fused triangle attention
+
+`TriangleAttention` (starting- and ending-node, including PairBlock's pre-transposed ending call) can fuse LN → pair-bias Linear → gated MHA → ``W_o`` [+ residual] as length-generic Triton kernels. Sequence length is not a specialize key. The pair-bias prologue decodes ``(i, j)`` from independent strides so a contig starting-node pair and a transposed ending-node view share one compile. Attention is flash / online-softmax: the ``[I, H, J, J]`` score matrix is never stored. Under the 2a ``OPENFOLD3_TRI_ATTN_CHUNK_CAP`` memory profile the same kernels run an I-row schedule so the cap stays the memory bound.
+
+In-place ``z + update`` writes are inference-only when ``residual`` is ``z``. Training rematerializes QKV from saved ``z`` / LN stats and keeps ``LSE``, ungated ``O``, and the ``[H, I, J]`` triangle bias. Backward uses Triton LN / Linear / gate / flash kernels and deterministic exclusive split-M ``dW`` (no atomics). Gate backward produces flash ``delta`` while ``O`` / ``dO`` are live, and row-block ``dBias`` / ``dW`` partials persist until one final reduction. Pair-bias writes ``[H, I, J]`` directly. Row-block QKVG reuses the Phase 3a LN→Linear launch when eligible. GEMM tiles autotune on ``GEMM_MODE`` only; the first small-N launch warms a large dummy ``J`` / ``M`` so a test-sized call cannot lock the winner. Ineligible shapes (bf16 weights, ``c > 128``, too few rows, linear bias, missing gate) keep the eager module.
+
+## Triton kernel
+
+On CUDA with a ``[1, N, N, C]`` activation, ``float32`` or ``bfloat16`` activations, fp32 Parameter masters, ``C_z = H × c_hidden ≤ 128``, ``c_hidden ∈ {16, 32, 64, 128}``, and at least 4096 pair rows, the fused path uses one ``GEMM_MODE`` for every ``tl.dot``:
+
+- `ieee` — fp32 activations and `torch.backends.cuda.matmul.allow_tf32` off
+- `tf32` — fp32 activations and `allow_tf32` on
+- `bf16` — bf16 activations with fp32 masters (downcast once before the MMA, accumulate in fp32)
+
+GEMM tiles autotune on ``GEMM_MODE`` only. Sequence length is not an autotune key. The flash forward may group two pair-rows per program (``I_TILE``) so they share one triangle-bias load. Backward uses one pair-row per program for occupancy, folds ``dBias`` into ``dQ`` with an exclusive I-split, and tiles deterministic ``dW`` over 64 input channels.
+
+```bash
+# Default: use Triton when eligible
+OPENFOLD3_FUSED_TRI_ATTN_V1=1
+
+# Force eager / cuEq / AMD Triton-evo / chunked inference triangle attention
+OPENFOLD3_FUSED_TRI_ATTN_V1=0
+```

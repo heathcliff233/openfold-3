@@ -25,9 +25,13 @@ PairBlock's transposed ending-node view share one kernel (no 1U ``z_norm``).
 Attention is flash / online-softmax: the ``[I, H, J, J]`` score matrix is
 never stored. The forward may group two pair-rows per program so they share
 one triangle-bias load. Training rematerializes QKV from saved ``z`` / LN
-stats, keeps ``LSE`` + ungated ``O`` + triangle bias, and uses a pure-Triton
-backward (LN apply / LN bwd / Linear / gate / flash / exclusive split-M
-``dW``, no ATen math). In-place residual writes are inference-only.
+stats and keeps ``LSE`` + ungated ``O`` + triangle bias. Backward uses Triton
+LN / Linear / gate / flash kernels and deterministic exclusive split-M
+``dW``. Gate backward also writes
+``delta = (dO*O).sum(-1)``. Flash backward folds ``dBias`` into ``dQ`` with
+an exclusive I-split (no atomics, no third QK rematerialization). Row-block
+``dBias`` / ``dW`` partials persist and reduce once. In-place residual writes
+are inference-only.
 Ineligible shapes use the matching-precision eager primitives.
 """
 
@@ -53,10 +57,15 @@ except ImportError:  # pragma: no cover
 _MAX_C = 128
 _MIN_M = 4096
 _BWD_SPLIT_M = 16
+_DW_BLOCK_K = 64
+# Exclusive I-split for folded dBias. Each program owns one split so the
+# ``[H, J, J]`` reduction does not use atomics; ``dQ`` is RMW'd in fp32.
+_BWD_BIAS_SPLIT = 16
 _DEFAULT_ROW_BLOCK = 128
 # First launch below these sizes warms autotune on a large dummy grid so a
 # test-sized call cannot lock the GEMM_MODE winner (same contract as trimul).
 _FLASH_WARM_J = 1024
+_FLASH_BWD_WARM_I = 16
 _PAIR_LN_WARM_M = 65536
 _LINEAR_WARM_M = 65536
 _TRUE = {"1", "true", "yes", "on"}
@@ -87,6 +96,15 @@ _FLASH_FWD_TILES = (
     (128, 16, 2, 8, 2),
 )
 _FLASH_BWD_TILES = (
+    (64, 16, 4, 2),
+    (128, 16, 4, 2),
+    (64, 32, 4, 2),
+    (128, 32, 4, 2),
+    (128, 16, 8, 2),
+    (64, 64, 4, 2),
+)
+# Fused dQ+dBias keeps a dBias tile live; stay under 128x32.
+_FLASH_BWD_DQ_TILES = (
     (64, 16, 4, 2),
     (128, 16, 4, 2),
     (64, 32, 4, 2),
@@ -625,37 +643,47 @@ if _TRITON_AVAILABLE:
             )
 
     @triton.autotune(
-        configs=_configs(_FLASH_BWD_TILES, ("BLOCK_M", "BLOCK_N")),
+        configs=_configs(_FLASH_BWD_DQ_TILES, ("BLOCK_M", "BLOCK_N")),
         key=["GEMM_MODE"],
         prune_configs_by={"early_config_prune": _prune_flash},
-        restore_value=["DQ_ptr"],
+        restore_value=["DQ_ptr", "DTB_ptr"],
     )
     @triton.jit(
-        do_not_specialize=["I_dim", "J_dim", "row_start", "softmax_scale", "mask_inf"],
+        do_not_specialize=[
+            "I_dim",
+            "J_dim",
+            "SPLIT",
+            "row_start",
+            "softmax_scale",
+            "mask_inf",
+        ],
         do_not_specialize_on_alignment=[
             "Q_ptr",
             "K_ptr",
             "V_ptr",
-            "O_ptr",
             "DO_ptr",
             "LSE_ptr",
+            "Delta_ptr",
             "TB_ptr",
             "Mask_ptr",
             "DQ_ptr",
+            "DTB_ptr",
         ],
     )
     def _flash_tri_attn_bwd_dq_kernel(
         Q_ptr,
         K_ptr,
         V_ptr,
-        O_ptr,
         DO_ptr,
         LSE_ptr,
+        Delta_ptr,
         TB_ptr,
         Mask_ptr,
         DQ_ptr,
+        DTB_ptr,
         I_dim,
         J_dim,
+        SPLIT,
         row_start,
         softmax_scale,
         mask_inf,
@@ -674,78 +702,112 @@ if _TRITON_AVAILABLE:
         GEMM_MODE: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        ACCUM_DTB: tl.constexpr,
     ):
+        """Exclusive fused ``dQ`` + ``dBias``: one program owns ``(split, h, q-tile)``.
+
+        ``N`` is looped so ``dQ`` is exclusive; ``I`` is looped so ``dBias`` is
+        exclusive (private ``[SPLIT, H, J, J]`` slot). Triangle bias is loaded
+        once per K-tile and reused across the split's pair-rows.
+        """
         pid_m = tl.program_id(0)
-        pid_ih = tl.program_id(1)
-        h = pid_ih % H
-        i = pid_ih // H
+        pid_sh = tl.program_id(1)
+        h = pid_sh % H
+        s = pid_sh // H
+        rows = (I_dim + SPLIT - 1) // SPLIT
+        i_start = s * rows
+        i_end = tl.minimum(i_start + rows, I_dim)
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_c = tl.arange(0, CH)
         mask_m = offs_m < J_dim
-        q_base = i * stride_q_i + h * stride_q_h
-        q = tl.load(
-            Q_ptr + q_base + offs_m[:, None] * stride_q_j + offs_c[None, :] * stride_q_c,
-            mask=mask_m[:, None],
-            other=0.0,
-        )
-        do = tl.load(
-            DO_ptr + q_base + offs_m[:, None] * stride_q_j + offs_c[None, :] * stride_q_c,
-            mask=mask_m[:, None],
-            other=0.0,
-        ).to(tl.float32)
-        o = tl.load(
-            O_ptr + q_base + offs_m[:, None] * stride_q_j + offs_c[None, :] * stride_q_c,
-            mask=mask_m[:, None],
-            other=0.0,
-        ).to(tl.float32)
-        lse = tl.load(LSE_ptr + (i * H + h) * J_dim + offs_m, mask=mask_m, other=0.0)
-        delta = tl.sum(do * o, axis=1)
-        dq = tl.zeros((BLOCK_M, CH), dtype=tl.float32)
         rcp = RCP_LN2
         tb_row = h * stride_tb_h + offs_m * stride_tb_j
-        mb_base = (i + row_start) * stride_mb_i
         for n0 in range(0, J_dim, BLOCK_N):
             offs_n = n0 + tl.arange(0, BLOCK_N)
             mask_n = offs_n < J_dim
-            k = tl.load(
-                K_ptr
-                + q_base
-                + offs_n[:, None] * stride_q_j
-                + offs_c[None, :] * stride_q_c,
-                mask=mask_n[:, None],
-                other=0.0,
-            )
-            v = tl.load(
-                V_ptr
-                + q_base
-                + offs_n[:, None] * stride_q_j
-                + offs_c[None, :] * stride_q_c,
-                mask=mask_n[:, None],
-                other=0.0,
-            )
-            qk = _dot_f32(q, tl.trans(k), GEMM_MODE) * (softmax_scale * rcp)
+            tile = mask_m[:, None] & mask_n[None, :]
             tb = tl.load(
                 TB_ptr + tb_row[:, None] + offs_n[None, :] * stride_tb_k,
-                mask=mask_m[:, None] & mask_n[None, :],
+                mask=tile,
                 other=0.0,
             ).to(tl.float32)
-            qk = qk + tb * rcp
-            if HAS_MASK:
-                mb = tl.load(Mask_ptr + mb_base + offs_n * stride_mb_j, mask=mask_n, other=0.0)
-                qk = qk + (mask_inf * (mb.to(tl.float32) - 1.0))[None, :] * rcp
-            qk = tl.where(mask_n[None, :], qk, float("-inf"))
-            p = tl.math.exp2(qk - lse[:, None])
-            dp = _dot_f32(do, tl.trans(v), GEMM_MODE)
-            ds = p * (dp - delta[:, None])
-            dq += _dot_f32(ds, k, GEMM_MODE) * softmax_scale
-        tl.store(
-            DQ_ptr
-            + q_base
-            + offs_m[:, None] * stride_q_j
-            + offs_c[None, :] * stride_q_c,
-            dq.to(DQ_ptr.dtype.element_ty),
-            mask=mask_m[:, None],
-        )
+            tb = tb * rcp
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for i in tl.range(i_start, i_end):
+                q_base = i * stride_q_i + h * stride_q_h
+                q = tl.load(
+                    Q_ptr
+                    + q_base
+                    + offs_m[:, None] * stride_q_j
+                    + offs_c[None, :] * stride_q_c,
+                    mask=mask_m[:, None],
+                    other=0.0,
+                )
+                do = tl.load(
+                    DO_ptr
+                    + q_base
+                    + offs_m[:, None] * stride_q_j
+                    + offs_c[None, :] * stride_q_c,
+                    mask=mask_m[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                lse = tl.load(
+                    LSE_ptr + (i * H + h) * J_dim + offs_m, mask=mask_m, other=0.0
+                )
+                delta = tl.load(
+                    Delta_ptr + (i * H + h) * J_dim + offs_m, mask=mask_m, other=0.0
+                )
+                k = tl.load(
+                    K_ptr
+                    + q_base
+                    + offs_n[:, None] * stride_q_j
+                    + offs_c[None, :] * stride_q_c,
+                    mask=mask_n[:, None],
+                    other=0.0,
+                )
+                k_scaled = k * softmax_scale
+                v = tl.load(
+                    V_ptr
+                    + q_base
+                    + offs_n[:, None] * stride_q_j
+                    + offs_c[None, :] * stride_q_c,
+                    mask=mask_n[:, None],
+                    other=0.0,
+                )
+                qk = _dot_f32(q, tl.trans(k_scaled), GEMM_MODE) * rcp + tb
+                if HAS_MASK:
+                    mb = tl.load(
+                        Mask_ptr + (i + row_start) * stride_mb_i + offs_n * stride_mb_j,
+                        mask=mask_n,
+                        other=0.0,
+                    )
+                    qk = qk + (mask_inf * (mb.to(tl.float32) - 1.0))[None, :] * rcp
+                qk = tl.where(tile, qk, float("-inf"))
+                p = tl.math.exp2(qk - lse[:, None])
+                ds = p * (_dot_f32(do, tl.trans(v), GEMM_MODE) - delta[:, None])
+                ds = tl.where(tile, ds, 0.0)
+                acc += ds
+                dq_tile = _dot_f32(ds, k_scaled, GEMM_MODE)
+                dq_ptr = (
+                    DQ_ptr
+                    + q_base
+                    + offs_m[:, None] * stride_q_j
+                    + offs_c[None, :] * stride_q_c
+                )
+                prev = tl.load(
+                    dq_ptr,
+                    mask=mask_m[:, None] & (n0 != 0),
+                    other=0.0,
+                )
+                tl.store(dq_ptr, prev + dq_tile, mask=mask_m[:, None])
+            dtb_ptr = (
+                DTB_ptr
+                + ((s * H + h) * J_dim + offs_m[:, None]) * J_dim
+                + offs_n[None, :]
+            )
+            if ACCUM_DTB:
+                acc += tl.load(dtb_ptr, mask=tile, other=0.0)
+            tl.store(dtb_ptr, acc, mask=tile)
 
     @triton.autotune(
         configs=_configs(_FLASH_BWD_TILES, ("BLOCK_M", "BLOCK_N")),
@@ -759,9 +821,9 @@ if _TRITON_AVAILABLE:
             "Q_ptr",
             "K_ptr",
             "V_ptr",
-            "O_ptr",
             "DO_ptr",
             "LSE_ptr",
+            "Delta_ptr",
             "TB_ptr",
             "Mask_ptr",
             "DK_ptr",
@@ -772,9 +834,9 @@ if _TRITON_AVAILABLE:
         Q_ptr,
         K_ptr,
         V_ptr,
-        O_ptr,
         DO_ptr,
         LSE_ptr,
+        Delta_ptr,
         TB_ptr,
         Mask_ptr,
         DK_ptr,
@@ -800,7 +862,7 @@ if _TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
-        """Exclusive dK/dV: one program owns a K-tile of one ``(i, h)``."""
+        """Exclusive dK/dV: one program owns a K-tile of one pair-row."""
         pid_n = tl.program_id(0)
         pid_ih = tl.program_id(1)
         h = pid_ih % H
@@ -823,10 +885,19 @@ if _TRITON_AVAILABLE:
         dv = tl.zeros((BLOCK_N, CH), dtype=tl.float32)
         rcp = RCP_LN2
         mb_base = (i + row_start) * stride_mb_i
+        if HAS_MASK:
+            mb = tl.load(Mask_ptr + mb_base + offs_n * stride_mb_j, mask=mask_n, other=0.0)
         tb_col = h * stride_tb_h + offs_n * stride_tb_k
         for m0 in range(0, J_dim, BLOCK_M):
             offs_m = m0 + tl.arange(0, BLOCK_M)
             mask_m = offs_m < J_dim
+            tile = mask_m[:, None] & mask_n[None, :]
+            tb = tl.load(
+                TB_ptr + offs_m[:, None] * stride_tb_j + tb_col[None, :],
+                mask=tile,
+                other=0.0,
+            ).to(tl.float32)
+            tb = tb * rcp
             q = tl.load(
                 Q_ptr
                 + q_base
@@ -835,6 +906,7 @@ if _TRITON_AVAILABLE:
                 mask=mask_m[:, None],
                 other=0.0,
             )
+            q_scaled = q * softmax_scale
             do = tl.load(
                 DO_ptr
                 + q_base
@@ -843,32 +915,18 @@ if _TRITON_AVAILABLE:
                 mask=mask_m[:, None],
                 other=0.0,
             ).to(tl.float32)
-            o = tl.load(
-                O_ptr
-                + q_base
-                + offs_m[:, None] * stride_q_j
-                + offs_c[None, :] * stride_q_c,
-                mask=mask_m[:, None],
-                other=0.0,
-            ).to(tl.float32)
             lse = tl.load(LSE_ptr + (i * H + h) * J_dim + offs_m, mask=mask_m, other=0.0)
-            delta = tl.sum(do * o, axis=1)
-            qk = _dot_f32(q, tl.trans(k), GEMM_MODE) * (softmax_scale * rcp)
-            tb = tl.load(
-                TB_ptr + offs_m[:, None] * stride_tb_j + tb_col[None, :],
-                mask=mask_m[:, None] & mask_n[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            qk = qk + tb * rcp
+            delta = tl.load(
+                Delta_ptr + (i * H + h) * J_dim + offs_m, mask=mask_m, other=0.0
+            )
+            qk = _dot_f32(q_scaled, tl.trans(k), GEMM_MODE) * rcp + tb
             if HAS_MASK:
-                mb = tl.load(Mask_ptr + mb_base + offs_n * stride_mb_j, mask=mask_n, other=0.0)
                 qk = qk + (mask_inf * (mb.to(tl.float32) - 1.0))[None, :] * rcp
-            qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
+            qk = tl.where(tile, qk, float("-inf"))
             p = tl.math.exp2(qk - lse[:, None])
-            dp = _dot_f32(do, tl.trans(v), GEMM_MODE)
-            ds = p * (dp - delta[:, None])
-            ds = tl.where(mask_m[:, None] & mask_n[None, :], ds, 0.0)
-            dk += _dot_f32(tl.trans(ds), q, GEMM_MODE) * softmax_scale
+            ds = p * (_dot_f32(do, tl.trans(v), GEMM_MODE) - delta[:, None])
+            ds = tl.where(tile, ds, 0.0)
+            dk += _dot_f32(tl.trans(ds), q_scaled, GEMM_MODE)
             dv += _dot_f32(tl.trans(p), do, GEMM_MODE)
         tl.store(
             DK_ptr
@@ -885,139 +943,6 @@ if _TRITON_AVAILABLE:
             + offs_c[None, :] * stride_q_c,
             dv.to(DV_ptr.dtype.element_ty),
             mask=mask_n[:, None],
-        )
-
-    @triton.autotune(
-        configs=_configs(_FLASH_BWD_TILES, ("BLOCK_M", "BLOCK_N")),
-        key=["GEMM_MODE"],
-        prune_configs_by={"early_config_prune": _prune_flash},
-        restore_value=["DTB_ptr"],
-    )
-    @triton.jit(
-        do_not_specialize=["I_dim", "J_dim", "row_start", "softmax_scale", "mask_inf"],
-        do_not_specialize_on_alignment=[
-            "Q_ptr",
-            "K_ptr",
-            "V_ptr",
-            "O_ptr",
-            "DO_ptr",
-            "LSE_ptr",
-            "TB_ptr",
-            "Mask_ptr",
-            "DTB_ptr",
-        ],
-    )
-    def _flash_tri_attn_bwd_dbias_kernel(
-        Q_ptr,
-        K_ptr,
-        V_ptr,
-        O_ptr,
-        DO_ptr,
-        LSE_ptr,
-        TB_ptr,
-        Mask_ptr,
-        DTB_ptr,
-        I_dim,
-        J_dim,
-        row_start,
-        softmax_scale,
-        mask_inf,
-        stride_q_i,
-        stride_q_j,
-        stride_q_h,
-        stride_q_c,
-        stride_tb_h,
-        stride_tb_j,
-        stride_tb_k,
-        stride_mb_i,
-        stride_mb_j,
-        H: tl.constexpr,
-        CH: tl.constexpr,
-        HAS_MASK: tl.constexpr,
-        GEMM_MODE: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-    ):
-        """Exclusive ``d`` triangle-bias: one program owns a ``(h, q-tile, k-tile)``."""
-        pid_m = tl.program_id(0)
-        pid_nh = tl.program_id(1)
-        h = pid_nh % H
-        pid_n = pid_nh // H
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        offs_c = tl.arange(0, CH)
-        mask_m = offs_m < J_dim
-        mask_n = offs_n < J_dim
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        rcp = RCP_LN2
-        tb_row = h * stride_tb_h + offs_m * stride_tb_j
-        # Triangle bias is independent of pair-row ``i``; load once.
-        tb = tl.load(
-            TB_ptr + tb_row[:, None] + offs_n[None, :] * stride_tb_k,
-            mask=mask_m[:, None] & mask_n[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        tb = tb * rcp
-        for i in range(0, I_dim):
-            q_base = i * stride_q_i + h * stride_q_h
-            q = tl.load(
-                Q_ptr
-                + q_base
-                + offs_m[:, None] * stride_q_j
-                + offs_c[None, :] * stride_q_c,
-                mask=mask_m[:, None],
-                other=0.0,
-            )
-            k = tl.load(
-                K_ptr
-                + q_base
-                + offs_n[:, None] * stride_q_j
-                + offs_c[None, :] * stride_q_c,
-                mask=mask_n[:, None],
-                other=0.0,
-            )
-            v = tl.load(
-                V_ptr
-                + q_base
-                + offs_n[:, None] * stride_q_j
-                + offs_c[None, :] * stride_q_c,
-                mask=mask_n[:, None],
-                other=0.0,
-            )
-            do = tl.load(
-                DO_ptr
-                + q_base
-                + offs_m[:, None] * stride_q_j
-                + offs_c[None, :] * stride_q_c,
-                mask=mask_m[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            o = tl.load(
-                O_ptr
-                + q_base
-                + offs_m[:, None] * stride_q_j
-                + offs_c[None, :] * stride_q_c,
-                mask=mask_m[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            lse = tl.load(LSE_ptr + (i * H + h) * J_dim + offs_m, mask=mask_m, other=0.0)
-            delta = tl.sum(do * o, axis=1)
-            qk = _dot_f32(q, tl.trans(k), GEMM_MODE) * (softmax_scale * rcp) + tb
-            if HAS_MASK:
-                mb = tl.load(
-                    Mask_ptr + (i + row_start) * stride_mb_i + offs_n * stride_mb_j,
-                    mask=mask_n,
-                    other=0.0,
-                )
-                qk = qk + (mask_inf * (mb.to(tl.float32) - 1.0))[None, :] * rcp
-            qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
-            p = tl.math.exp2(qk - lse[:, None])
-            dp = _dot_f32(do, tl.trans(v), GEMM_MODE)
-            acc += p * (dp - delta[:, None])
-        tl.store(
-            DTB_ptr + h * J_dim * J_dim + offs_m[:, None] * J_dim + offs_n[None, :],
-            acc,
-            mask=mask_m[:, None] & mask_n[None, :],
         )
 
     @triton.autotune(
@@ -1042,13 +967,14 @@ if _TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        ACCUM_P: tl.constexpr,
     ):
         split = tl.program_id(0)
         rows = (M + SPLIT_M - 1) // SPLIT_M
         start = split * rows
         end = tl.minimum(start + rows, M)
         offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
-        offs_k = tl.arange(0, BLOCK_K)
+        offs_k = tl.program_id(2) * BLOCK_K + tl.arange(0, BLOCK_K)
         n_mask = offs_n < N
         k_mask = offs_k < K
         acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
@@ -1066,11 +992,14 @@ if _TRITON_AVAILABLE:
                 other=0.0,
             )
             acc += _dot_f32(tl.trans(go), x, GEMM_MODE)
-        tl.store(
-            P_ptr + split * N * K + offs_n[:, None] * K + offs_k[None, :],
-            acc,
-            mask=n_mask[:, None] & k_mask[None, :],
-        )
+        p_ptr = P_ptr + split * N * K + offs_n[:, None] * K + offs_k[None, :]
+        if ACCUM_P:
+            acc += tl.load(
+                p_ptr,
+                mask=n_mask[:, None] & k_mask[None, :],
+                other=0.0,
+            )
+        tl.store(p_ptr, acc, mask=n_mask[:, None] & k_mask[None, :])
 
     def _ln_configs():
         return [
@@ -1305,6 +1234,7 @@ if _TRITON_AVAILABLE:
             "DO_ptr",
             "DG_ptr",
             "GATED_ptr",
+            "Delta_ptr",
         ],
     )
     def _gate_bwd_kernel(
@@ -1314,8 +1244,12 @@ if _TRITON_AVAILABLE:
         DO_ptr,
         DG_ptr,
         GATED_ptr,
+        Delta_ptr,
         M,
+        J_dim,
         C: tl.constexpr,
+        H: tl.constexpr,
+        CH: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_K: tl.constexpr,
         GEMM_MODE: tl.constexpr,
@@ -1344,6 +1278,20 @@ if _TRITON_AVAILABLE:
         gated = o * sig
         d_o = datt * sig
         d_g = datt * o * sig * (1.0 - sig)
+        delta = tl.sum(
+            tl.reshape(d_o * o, (BLOCK_M, H, CH)),
+            axis=2,
+        )
+        offs_h = tl.arange(0, H)
+        offs_i = offs_m // J_dim
+        offs_j = offs_m - offs_i * J_dim
+        tl.store(
+            Delta_ptr
+            + (offs_i[:, None] * H + offs_h[None, :]) * J_dim
+            + offs_j[:, None],
+            delta,
+            mask=m_mask[:, None],
+        )
         tl.store(
             GATED_ptr + offs_m.to(tl.int64)[:, None] * C + offs_c[None, :],
             gated.to(GATED_ptr.dtype.element_ty),
@@ -1369,7 +1317,6 @@ else:  # pragma: no cover
     _flash_tri_attn_fwd_kernel = _unavailable
     _flash_tri_attn_bwd_dq_kernel = _unavailable
     _flash_tri_attn_bwd_dkv_kernel = _unavailable
-    _flash_tri_attn_bwd_dbias_kernel = _unavailable
     _split_m_dw_kernel = _unavailable
     _ln_apply_kernel = _unavailable
     _ln_bwd_kernel = _unavailable
@@ -1683,16 +1630,23 @@ def _ensure_flash_bwd_autotune(
     if key in _flash_bwd_autotune_ready:
         return
     j = _FLASH_WARM_J
-    dummy_q = torch.empty((1, j, heads, ch), device=q.device, dtype=q.dtype)
+    rows = _FLASH_BWD_WARM_I
+    split = min(_BWD_BIAS_SPLIT, rows)
+    dummy_q = torch.empty((rows, j, heads, ch), device=q.device, dtype=q.dtype)
     dummy_tb = torch.empty((heads, j, j), device=q.device, dtype=q.dtype)
-    dummy_mask = torch.ones((1, j), device=q.device, dtype=q.dtype)
-    dummy_lse = torch.empty((1, heads, j), device=q.device, dtype=torch.float32)
-    dummy_dq = torch.empty_like(dummy_q)
+    dummy_mask = torch.ones((rows, j), device=q.device, dtype=q.dtype)
+    dummy_lse = torch.empty((rows, heads, j), device=q.device, dtype=torch.float32)
+    dummy_delta = torch.empty((rows, heads, j), device=q.device, dtype=torch.float32)
+    dummy_dq = torch.empty(
+        (rows, j, heads, ch), device=q.device, dtype=torch.float32
+    )
     dummy_dk = torch.empty_like(dummy_q)
     dummy_dv = torch.empty_like(dummy_q)
-    dummy_dtb = torch.zeros((heads, j, j), device=q.device, dtype=torch.float32)
+    dummy_dtb = torch.empty(
+        (split, heads, j, j), device=q.device, dtype=torch.float32
+    )
     shared = dict(
-        I_dim=1,
+        I_dim=rows,
         J_dim=j,
         row_start=0,
         softmax_scale=1.0,
@@ -1711,29 +1665,41 @@ def _ensure_flash_bwd_autotune(
         HAS_MASK=has_mask,
         GEMM_MODE=mode,
     )
-    args = (
-        dummy_q,
+
+    def q_grid(meta):
+        return (triton.cdiv(j, meta["BLOCK_M"]), split * heads)
+
+    def kv_grid(meta):
+        return (triton.cdiv(j, meta["BLOCK_N"]), rows * heads)
+
+    _flash_tri_attn_bwd_dq_kernel[q_grid](
         dummy_q,
         dummy_q,
         dummy_q,
         dummy_q,
         dummy_lse,
+        dummy_delta,
         dummy_tb,
         dummy_mask,
+        dummy_dq,
+        dummy_dtb,
+        SPLIT=split,
+        ACCUM_DTB=False,
+        **shared,
     )
-
-    def q_grid(meta):
-        return (triton.cdiv(j, meta["BLOCK_M"]), heads)
-
-    def kv_grid(meta):
-        return (triton.cdiv(j, meta["BLOCK_N"]), heads)
-
-    def bias_grid(meta):
-        return (triton.cdiv(j, meta["BLOCK_M"]), triton.cdiv(j, meta["BLOCK_N"]) * heads)
-
-    _flash_tri_attn_bwd_dq_kernel[q_grid](*args, dummy_dq, **shared)
-    _flash_tri_attn_bwd_dkv_kernel[kv_grid](*args, dummy_dk, dummy_dv, **shared)
-    _flash_tri_attn_bwd_dbias_kernel[bias_grid](*args, dummy_dtb, **shared)
+    _flash_tri_attn_bwd_dkv_kernel[kv_grid](
+        dummy_q,
+        dummy_q,
+        dummy_q,
+        dummy_q,
+        dummy_lse,
+        dummy_delta,
+        dummy_tb,
+        dummy_mask,
+        dummy_dk,
+        dummy_dv,
+        **shared,
+    )
     _flash_bwd_autotune_ready.add(key)
 
 
@@ -1741,27 +1707,27 @@ def _flash_bwd(
     q,
     k,
     v,
-    o,
     do,
     lse,
+    delta,
     triangle_bias,
     mask,
+    dtb_partial,
     row_start: int,
     scale: float,
     mask_inf: float,
+    *,
+    accumulate_dtb: bool = False,
 ):
     q = q if q.is_contiguous() else q.contiguous()
     k = k if k.is_contiguous() else k.contiguous()
     v = v if v.is_contiguous() else v.contiguous()
-    o = o if o.is_contiguous() else o.contiguous()
     do = do if do.is_contiguous() else do.contiguous()
     rows, j, heads, ch = q.shape
-    dq = torch.empty_like(q)
+    split = min(_BWD_BIAS_SPLIT, max(rows, 1))
+    dq_acc = torch.empty((rows, j, heads, ch), device=q.device, dtype=torch.float32)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
-    dtb = torch.zeros(
-        (heads, j, j), device=q.device, dtype=torch.float32
-    )
     dummy = q
     mode = _gemm_mode(q)
     has_mask = mask is not None
@@ -1789,43 +1755,80 @@ def _flash_bwd(
     )
 
     def q_grid(meta):
-        return (triton.cdiv(j, meta["BLOCK_M"]), rows * heads)
+        return (triton.cdiv(j, meta["BLOCK_M"]), split * heads)
 
     def kv_grid(meta):
         return (triton.cdiv(j, meta["BLOCK_N"]), rows * heads)
 
-    def bias_grid(meta):
-        return (triton.cdiv(j, meta["BLOCK_M"]), triton.cdiv(j, meta["BLOCK_N"]) * heads)
+    mask_ptr = mask if mask is not None else dummy
+    _flash_tri_attn_bwd_dq_kernel[q_grid](
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        triangle_bias,
+        mask_ptr,
+        dq_acc,
+        dtb_partial,
+        SPLIT=split,
+        ACCUM_DTB=accumulate_dtb,
+        **shared,
+    )
+    _flash_tri_attn_bwd_dkv_kernel[kv_grid](
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        triangle_bias,
+        mask_ptr,
+        dk,
+        dv,
+        **shared,
+    )
+    dq = dq_acc if q.dtype == torch.float32 else dq_acc.to(dtype=q.dtype)
+    return dq, dk, dv
 
-    args = (q, k, v, o, do, lse, triangle_bias, mask if mask is not None else dummy)
-    _flash_tri_attn_bwd_dq_kernel[q_grid](*args, dq, **shared)
-    _flash_tri_attn_bwd_dkv_kernel[kv_grid](*args, dk, dv, **shared)
-    _flash_tri_attn_bwd_dbias_kernel[bias_grid](*args, dtb, **shared)
-    return dq, dk, dv, dtb
 
-
-def _split_m_dw(x: torch.Tensor, go: torch.Tensor) -> torch.Tensor:
+def _split_m_dw(
+    x: torch.Tensor,
+    go: torch.Tensor,
+    partial: torch.Tensor | None = None,
+    *,
+    accumulate: bool = False,
+) -> torch.Tensor:
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton is required for fused_tri_attn")
     m, k = x.shape
     n = go.shape[1]
-    p = torch.empty((_BWD_SPLIT_M, n, k), dtype=torch.float32, device=x.device)
+    if partial is None:
+        partial = torch.empty(
+            (_BWD_SPLIT_M, n, k), dtype=torch.float32, device=x.device
+        )
 
     def grid(meta):
-        return (_BWD_SPLIT_M, triton.cdiv(n, meta["BLOCK_N"]))
+        return (
+            _BWD_SPLIT_M,
+            triton.cdiv(n, meta["BLOCK_N"]),
+            triton.cdiv(k, _DW_BLOCK_K),
+        )
 
     _split_m_dw_kernel[grid](
         x.contiguous(),
         go.contiguous(),
-        p,
+        partial,
         m,
         K=k,
         N=n,
         GEMM_MODE=_gemm_mode(x),
         SPLIT_M=_BWD_SPLIT_M,
-        BLOCK_K=max(_next_power_of_two(k), 16),
+        BLOCK_K=min(_DW_BLOCK_K, max(_next_power_of_two(k), 16)),
+        ACCUM_P=accumulate,
     )
-    return p.sum(0)
+    return partial
 
 
 def _linear_autotune_key(x, w, kind: str):
@@ -2006,19 +2009,21 @@ def _ln_bwd(
 
 
 def _gate_bwd(o: torch.Tensor, g: torch.Tensor, d_attn: torch.Tensor):
-    """``sig = σ(g)``; write gated ``O``, ``dO``, ``dG``."""
+    """``sig = σ(g)``; write gated ``O``, ``dO``, ``dG``, and flash ``delta``."""
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton is required for fused_tri_attn")
     o = o if o.is_contiguous() else o.contiguous()
     g = g if g.is_contiguous() else g.contiguous()
     d_attn = d_attn if d_attn.is_contiguous() else d_attn.contiguous()
-    m, c = o.reshape(o.shape[0], -1).shape
+    rows, j, heads, ch = o.shape
+    m, c = rows * j, heads * ch
     o2 = o.reshape(m, c)
     g2 = g.reshape(m, c)
     da2 = d_attn.reshape(m, c)
     d_o = torch.empty_like(o2)
     d_g = torch.empty_like(g2)
     gated = torch.empty_like(o2)
+    delta = torch.empty((rows, heads, j), device=o.device, dtype=torch.float32)
 
     def grid(meta):
         return (triton.cdiv(m, meta["BLOCK_M"]),)
@@ -2030,12 +2035,16 @@ def _gate_bwd(o: torch.Tensor, g: torch.Tensor, d_attn: torch.Tensor):
         d_o,
         d_g,
         gated,
+        delta,
         m,
+        j,
         C=c,
+        H=heads,
+        CH=ch,
         BLOCK_K=max(_next_power_of_two(c), 16),
         GEMM_MODE=_gemm_mode(o),
     )
-    return d_o, d_g, gated
+    return d_o, d_g, gated, delta
 
 
 def _row_block(n_i: int, chunk_size: int | None) -> int:
@@ -2242,9 +2251,17 @@ def _fused_tri_attn_backward(
         if mask_c.dim() == 3:
             mask_c = mask_c[0]
     d_z_hat = torch.zeros_like(z_hat)
-    d_qkvg_w = torch.zeros_like(w_qkvg, dtype=torch.float32)
-    d_wo = torch.zeros_like(wo, dtype=torch.float32)
-    d_tb = torch.zeros((heads, n_j, n_j), device=z.device, dtype=torch.float32)
+    d_qkvg_w_partial = torch.empty(
+        (_BWD_SPLIT_M, *w_qkvg.shape), device=z.device, dtype=torch.float32
+    )
+    d_wo_partial = torch.empty(
+        (_BWD_SPLIT_M, *wo.shape), device=z.device, dtype=torch.float32
+    )
+    d_tb_partial = torch.empty(
+        (min(_BWD_BIAS_SPLIT, n_i), heads, n_j, n_j),
+        device=z.device,
+        dtype=torch.float32,
+    )
     block = _DEFAULT_ROW_BLOCK
     for start in range(0, n_i, block):
         end = min(n_i, start + block)
@@ -2254,35 +2271,45 @@ def _fused_tri_attn_backward(
         o = o_ungated[start:end]
         go_block = go[0, start:end].reshape(rows * n_j, c_in)
         d_attn = _linear_dx(go_block, wo)
-        d_o, d_g_pre, attn_gated = _gate_bwd(
-            o.reshape(rows * n_j, heads * ch),
-            g.reshape(rows * n_j, heads * ch),
-            d_attn,
+        d_o, d_g_pre, attn_gated, delta = _gate_bwd(o, g, d_attn)
+        _split_m_dw(
+            attn_gated,
+            go_block,
+            d_wo_partial,
+            accumulate=start > 0,
         )
-        d_wo += _split_m_dw(attn_gated, go_block)
-        dq, dk, dv, dtb = _flash_bwd(
+        dq, dk, dv = _flash_bwd(
             q,
             k,
             v,
-            o,
             d_o.view(rows, n_j, heads, ch),
             lse[start:end],
+            delta,
             tb,
             mask_c,
+            d_tb_partial,
             start,
             scale,
             inf,
+            accumulate_dtb=start > 0,
         )
-        d_tb += dtb
         d_qkvg = torch.stack(
             [dq, dk, dv, d_g_pre.view(rows, n_j, heads, ch)], dim=2
         ).reshape(rows * n_j, 4 * heads * ch)
-        d_qkvg_w += _split_m_dw(zn.reshape(rows * n_j, c_in), d_qkvg)
+        _split_m_dw(
+            zn.reshape(rows * n_j, c_in),
+            d_qkvg,
+            d_qkvg_w_partial,
+            accumulate=start > 0,
+        )
         d_zn = _linear_dx(d_qkvg, w_qkvg)
         d_z_hat[0, start:end] += d_zn.view(rows, n_j, c_in)
         del q, k, v, g, o, dq, dk, dv, d_qkvg, d_zn
+    d_qkvg_w = d_qkvg_w_partial.sum(0)
+    d_wo = d_wo_partial.sum(0)
+    d_tb = d_tb_partial.sum(0)
     d_tb_flat = d_tb.permute(1, 2, 0).reshape(-1, heads).to(dtype=z.dtype)
-    d_wz = _split_m_dw(z_hat.reshape(-1, c_in), d_tb_flat)
+    d_wz = _split_m_dw(z_hat.reshape(-1, c_in), d_tb_flat).sum(0)
     d_z_hat = d_z_hat + _linear_dx(d_tb_flat, wz_d).view(1, n_i, n_j, c_in)
     d_z, d_ln_w, d_ln_b = _ln_bwd(
         z.reshape(-1, c_in),
