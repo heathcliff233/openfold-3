@@ -1224,7 +1224,7 @@ if _TRITON_AVAILABLE:
             mask=m_mask[:, None] & k_mask[None, :],
         )
 
-    @triton.autotune(configs=_ln_configs(), key=["GEMM_MODE"], restore_value=["DO_ptr"])
+    @triton.autotune(configs=_ln_configs(), key=[], restore_value=["DO_ptr"])
     @triton.jit(
         do_not_specialize=["M"],
         do_not_specialize_on_alignment=[
@@ -1252,7 +1252,6 @@ if _TRITON_AVAILABLE:
         CH: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_K: tl.constexpr,
-        GEMM_MODE: tl.constexpr,
     ):
         pid = tl.program_id(0)
         offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -2042,7 +2041,6 @@ def _gate_bwd(o: torch.Tensor, g: torch.Tensor, d_attn: torch.Tensor):
         H=heads,
         CH=ch,
         BLOCK_K=max(_next_power_of_two(c), 16),
-        GEMM_MODE=_gemm_mode(o),
     )
     return d_o, d_g, gated, delta
 
