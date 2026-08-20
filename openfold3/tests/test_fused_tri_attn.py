@@ -229,6 +229,67 @@ def test_module_dispatch_uses_fused(monkeypatch):
     torch.testing.assert_close(y, y_ref, atol=2e-3, rtol=2e-3)
 
 
+def test_autograd_matches_eager_tf32():
+    _set_tf32(True)
+    module = _module()
+    z, mask = _pair()
+    z_f = z.detach().requires_grad_(True)
+    leaves = [t.detach().requires_grad_(True) for t in _weights(module)]
+    y = fused_tri_attn(z_f, mask, *leaves, **_kwargs(module))
+    y.square().mean().backward()
+    z_e = z.detach().requires_grad_(True)
+    leaves_e = [t.detach().requires_grad_(True) for t in _weights(module)]
+    y_e = eager_tri_attn(z_e, mask, *leaves_e, **_kwargs(module))
+    y_e.square().mean().backward()
+    torch.testing.assert_close(z_f.grad, z_e.grad, atol=2e-2, rtol=5e-3)
+    for a, b in zip(leaves, leaves_e):
+        torch.testing.assert_close(a.grad, b.grad, atol=2e-2, rtol=5e-3)
+
+
+def test_autograd_matches_eager_bf16_mixed():
+    _set_tf32(False)
+    module = _module()
+    z, mask = _pair(dtype=torch.bfloat16)
+    z_f = z.detach().requires_grad_(True)
+    leaves = [t.detach().requires_grad_(True) for t in _weights(module)]
+    fused_tri_attn(z_f, mask, *leaves, **_kwargs(module)).square().mean().backward()
+    z_e = z.detach().requires_grad_(True)
+    leaves_e = [t.detach().requires_grad_(True) for t in _weights(module)]
+    eager_tri_attn(z_e, mask, *leaves_e, **_kwargs(module)).square().mean().backward()
+    torch.testing.assert_close(z_f.grad.float(), z_e.grad.float(), atol=8e-2, rtol=3e-2)
+
+
+def test_autograd_incoming_ieee():
+    _set_tf32(False)
+    module = _module(starting=False)
+    z, mask = _pair()
+    z_f = z.detach().requires_grad_(True)
+    leaves = [t.detach().requires_grad_(True) for t in _weights(module)]
+    fused_tri_attn(z_f, mask, *leaves, **_kwargs(module)).square().mean().backward()
+    z_e = z.detach().requires_grad_(True)
+    leaves_e = [t.detach().requires_grad_(True) for t in _weights(module)]
+    eager_tri_attn(z_e, mask, *leaves_e, **_kwargs(module)).square().mean().backward()
+    torch.testing.assert_close(z_f.grad, z_e.grad, atol=8e-3, rtol=3e-3)
+
+
+def test_weight_gradients_are_deterministic():
+    _set_tf32(False)
+    module = _module()
+    z, mask = _pair()
+    grad_out = torch.randn_like(z)
+
+    def run():
+        leaves = [z.detach().requires_grad_(True)] + [
+            t.detach().requires_grad_(True) for t in _weights(module)
+        ]
+        fused_tri_attn(leaves[0], mask, *leaves[1:], **_kwargs(module)).backward(
+            grad_out
+        )
+        return [t.grad.clone() for t in leaves]
+
+    assert all(torch.equal(a, b) for a, b in zip(run(), run()))
+
+
 def test_compile_reuse_across_lengths():
     script = r"""
 import json
@@ -237,6 +298,7 @@ from pathlib import Path
 import torch
 from openfold3.core.kernels.triton.fused_tri_attn import (
     _flash_tri_attn_fwd_kernel,
+    _flash_tri_attn_bwd_dq_kernel,
     _pair_ln_linear_fwd_kernel,
     fused_tri_attn,
 )
@@ -250,6 +312,7 @@ def count(name):
 def snapshot():
     return {
         "flash": count("_flash_tri_attn_fwd_kernel"),
+        "bwd_dq": count("_flash_tri_attn_bwd_dq_kernel"),
         "pair_ln": count("_pair_ln_linear_fwd_kernel"),
     }
 
@@ -274,6 +337,9 @@ def run(n):
     mask = torch.ones(1, n, n, device="cuda")
     with torch.inference_mode():
         fused_tri_attn(z, mask, *weights, **kwargs)
+    zd = z.detach().requires_grad_(True)
+    leaves = [t.detach().requires_grad_(True) for t in weights]
+    fused_tri_attn(zd, mask, *leaves, **kwargs).backward(torch.ones_like(z))
 
 run(lengths[0])
 after_first = snapshot()
@@ -281,6 +347,7 @@ for n in lengths[1:]:
     run(n)
 after_all = snapshot()
 assert after_first["flash"] >= 1, after_first
+assert after_first["bwd_dq"] >= 1, after_first
 assert after_first["pair_ln"] >= 1, after_first
 assert after_all == after_first, (after_first, after_all)
 print(json.dumps({"after_first": after_first, "after_all": after_all}))
