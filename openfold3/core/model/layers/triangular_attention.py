@@ -112,14 +112,32 @@ class TriangleAttention(nn.Module):
         use_triton_triangle_kernels: bool = False,
         use_lma: bool = False,
         inplace_safe: bool = False,
+        residual: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
             x:
                 [*, I, J, C_in] input tensor (e.g. the pair representation)
+            residual:
+                Optional inference-only ``x + update`` destination. When it is
+                ``x``, the fused path may write in place and the caller must
+                not add again.
         Returns:
             [*, I, J, C_in] output tensor
         """
+        from openfold3.core.kernels.triton.fused_tri_attn import (
+            fused_tri_attn_from_module,
+        )
+
+        fused = fused_tri_attn_from_module(
+            self,
+            x,
+            mask,
+            residual=residual,
+            chunk_size=chunk_size,
+        )
+        if fused is not None:
+            return fused
 
         if mask is None:
             # [*, I, J]
@@ -170,6 +188,9 @@ class TriangleAttention(nn.Module):
         if not self.starting:
             x = x.transpose(-2, -3)
 
+        if residual is not None:
+            residual.add_(x)
+            return residual
         return x
 
 

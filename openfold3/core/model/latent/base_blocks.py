@@ -376,43 +376,69 @@ class PairBlock(nn.Module):
         inplace_safe: bool = False,
     ) -> torch.Tensor:
         """Perform the starting and ending triangular attention layers."""
-        z = add(
-            z,
-            self.ps_dropout_row_layer(
-                self.tri_att_start(
-                    z,
-                    mask=pair_mask,
-                    chunk_size=_attn_chunk_size,
-                    use_deepspeed_evo_attention=use_deepspeed_evo_attention,
-                    use_cueq_triangle_kernels=use_cueq_triangle_kernels,
-                    use_triton_triangle_kernels=use_triton_triangle_kernels,
-                    use_lma=use_lma,
-                    inplace_safe=inplace_safe,
-                )
-            ),
-            inplace=inplace_safe,
-        )
+        if inplace_safe:
+            z = self.tri_att_start(
+                z,
+                mask=pair_mask,
+                chunk_size=_attn_chunk_size,
+                use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                use_cueq_triangle_kernels=use_cueq_triangle_kernels,
+                use_triton_triangle_kernels=use_triton_triangle_kernels,
+                use_lma=use_lma,
+                inplace_safe=inplace_safe,
+                residual=z,
+            )
+        else:
+            z = add(
+                z,
+                self.ps_dropout_row_layer(
+                    self.tri_att_start(
+                        z,
+                        mask=pair_mask,
+                        chunk_size=_attn_chunk_size,
+                        use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_cueq_triangle_kernels=use_cueq_triangle_kernels,
+                        use_triton_triangle_kernels=use_triton_triangle_kernels,
+                        use_lma=use_lma,
+                        inplace_safe=inplace_safe,
+                    )
+                ),
+                inplace=False,
+            )
 
         z = z.transpose(-2, -3)
 
         # Using dropout_row_layer since the dimensions were transposed before
         # calling the attention layer
-        z = add(
-            z,
-            self.ps_dropout_row_layer(
-                self.tri_att_end(
-                    z,
-                    mask=pair_mask.transpose(-1, -2),
-                    chunk_size=_attn_chunk_size,
-                    use_deepspeed_evo_attention=use_deepspeed_evo_attention,
-                    use_cueq_triangle_kernels=use_cueq_triangle_kernels,
-                    use_triton_triangle_kernels=use_triton_triangle_kernels,
-                    use_lma=use_lma,
-                    inplace_safe=inplace_safe,
-                )
-            ),
-            inplace=inplace_safe,
-        )
+        if inplace_safe:
+            z = self.tri_att_end(
+                z,
+                mask=pair_mask.transpose(-1, -2),
+                chunk_size=_attn_chunk_size,
+                use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                use_cueq_triangle_kernels=use_cueq_triangle_kernels,
+                use_triton_triangle_kernels=use_triton_triangle_kernels,
+                use_lma=use_lma,
+                inplace_safe=inplace_safe,
+                residual=z,
+            )
+        else:
+            z = add(
+                z,
+                self.ps_dropout_row_layer(
+                    self.tri_att_end(
+                        z,
+                        mask=pair_mask.transpose(-1, -2),
+                        chunk_size=_attn_chunk_size,
+                        use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_cueq_triangle_kernels=use_cueq_triangle_kernels,
+                        use_triton_triangle_kernels=use_triton_triangle_kernels,
+                        use_lma=use_lma,
+                        inplace_safe=inplace_safe,
+                    )
+                ),
+                inplace=False,
+            )
 
         z = z.transpose(-2, -3)
 
