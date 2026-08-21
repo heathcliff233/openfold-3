@@ -1127,7 +1127,7 @@ if _TRITON_AVAILABLE:
 
     @triton.autotune(
         configs=_configs(_LINEAR_TILES, ("BLOCK_M", "BLOCK_N")),
-        key=["GEMM_MODE"],
+        key=["GEMM_MODE", "OUTPUT_SOA"],
         prune_configs_by={"early_config_prune": _prune_dw},
         restore_value=["Y_ptr"],
     )
@@ -1146,8 +1146,13 @@ if _TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        OUTPUT_SOA: tl.constexpr,
+        GROUP_C: tl.constexpr,
     ):
-        """``Y = X @ W^T`` with ``X[M,K]``, ``W[N,K]``."""
+        """``Y = X @ W^T`` with ``X[M,K]``, ``W[N,K]``.
+
+        Packed store is ``[M, N]``. SoA store is ``[N/GROUP_C, M, GROUP_C]``.
+        """
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -1169,11 +1174,24 @@ if _TRITON_AVAILABLE:
                 other=0.0,
             )
             acc += _dot_f32(x, tl.trans(w), GEMM_MODE)
-        tl.store(
-            Y_ptr + offs_m.to(tl.int64)[:, None] * N + offs_n[None, :],
-            acc.to(Y_ptr.dtype.element_ty),
-            mask=m_mask[:, None] & n_mask[None, :],
-        )
+        y = acc.to(Y_ptr.dtype.element_ty)
+        if OUTPUT_SOA:
+            group = offs_n // GROUP_C
+            c = offs_n - group * GROUP_C
+            tl.store(
+                Y_ptr
+                + (group.to(tl.int64)[None, :] * M + offs_m.to(tl.int64)[:, None])
+                * GROUP_C
+                + c[None, :],
+                y,
+                mask=m_mask[:, None] & n_mask[None, :],
+            )
+        else:
+            tl.store(
+                Y_ptr + offs_m.to(tl.int64)[:, None] * N + offs_n[None, :],
+                y,
+                mask=m_mask[:, None] & n_mask[None, :],
+            )
 
     @triton.autotune(
         configs=_configs(_LINEAR_TILES, ("BLOCK_M", "BLOCK_N")),
@@ -1861,7 +1879,35 @@ def _ensure_linear_autotune(x: torch.Tensor, w: torch.Tensor, kind: str) -> None
             return (triton.cdiv(m, meta["BLOCK_M"]), triton.cdiv(n, meta["BLOCK_N"]))
 
         _linear_fwd_kernel[grid](
-            dummy_x, dummy_w, dummy_y, m, K=k, N=n, GEMM_MODE=mode, BLOCK_K=block_k
+            dummy_x,
+            dummy_w,
+            dummy_y,
+            m,
+            K=k,
+            N=n,
+            GEMM_MODE=mode,
+            BLOCK_K=block_k,
+            OUTPUT_SOA=False,
+            GROUP_C=1,
+        )
+    elif kind == "fwd_soa":
+        group_c = n // 4
+        dummy_soa = torch.empty((4, m, group_c), device=x.device, dtype=x.dtype)
+
+        def grid(meta):
+            return (triton.cdiv(m, meta["BLOCK_M"]), triton.cdiv(n, meta["BLOCK_N"]))
+
+        _linear_fwd_kernel[grid](
+            dummy_x,
+            dummy_w,
+            dummy_soa,
+            m,
+            K=k,
+            N=n,
+            GEMM_MODE=mode,
+            BLOCK_K=block_k,
+            OUTPUT_SOA=True,
+            GROUP_C=group_c,
         )
     else:
 
@@ -1898,6 +1944,39 @@ def _linear_fwd(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         N=n,
         GEMM_MODE=_gemm_mode(x),
         BLOCK_K=max(_next_power_of_two(k), 16),
+        OUTPUT_SOA=False,
+        GROUP_C=1,
+    )
+    return y
+
+
+def _linear_fwd_soa(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """``Y = X @ W^T`` stored as ``[4, M, N/4]`` for rematerialized QKVG."""
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("Triton is required for fused_tri_attn")
+    x = x if x.is_contiguous() else x.contiguous()
+    w = w if w.is_contiguous() else w.contiguous()
+    m, k = x.shape
+    n = w.shape[0]
+    group_c = n // 4
+    y = torch.empty((4, m, group_c), device=x.device, dtype=x.dtype)
+    if m < _LINEAR_WARM_M:
+        _ensure_linear_autotune(x, w, "fwd_soa")
+
+    def grid(meta):
+        return (triton.cdiv(m, meta["BLOCK_M"]), triton.cdiv(n, meta["BLOCK_N"]))
+
+    _linear_fwd_kernel[grid](
+        x,
+        w,
+        y,
+        m,
+        K=k,
+        N=n,
+        GEMM_MODE=_gemm_mode(x),
+        BLOCK_K=max(_next_power_of_two(k), 16),
+        OUTPUT_SOA=True,
+        GROUP_C=group_c,
     )
     return y
 
@@ -2053,8 +2132,8 @@ def _row_block(n_i: int, chunk_size: int | None) -> int:
 
 def _project_qkvg(z_norm: torch.Tensor, w_qkvg: torch.Tensor, heads: int, ch: int):
     rows, j, c_in = z_norm.shape
-    qkvg = _linear_fwd(z_norm.reshape(-1, c_in), w_qkvg)
-    qkvg = qkvg.view(rows, j, 4, heads, ch).permute(2, 0, 1, 3, 4).contiguous()
+    qkvg = _linear_fwd_soa(z_norm.reshape(-1, c_in), w_qkvg)
+    qkvg = qkvg.view(4, rows, j, heads, ch)
     return qkvg[0], qkvg[1], qkvg[2], qkvg[3]
 
 
