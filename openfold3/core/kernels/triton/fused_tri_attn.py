@@ -74,6 +74,7 @@ _flash_autotune_ready: set[tuple] = set()
 _flash_bwd_autotune_ready: set[tuple] = set()
 _pair_ln_autotune_ready: set[tuple] = set()
 _linear_autotune_ready: set[tuple] = set()
+_dx_gate_autotune_ready: set[tuple] = set()
 
 # Large-N biased; J is not an autotune key. Forward can afford larger K tiles
 # than backward (fewer live accumulators). ``I_TILE`` groups pair-rows that
@@ -1374,6 +1375,110 @@ if _TRITON_AVAILABLE:
             mask=m_mask[:, None] & c_mask[None, :],
         )
 
+    @triton.autotune(
+        configs=_configs(_LINEAR_TILES, ("BLOCK_M", "BLOCK_N")),
+        key=["GEMM_MODE"],
+        prune_configs_by={"early_config_prune": _prune_dw},
+        restore_value=["DO_ptr", "DG_ptr", "GATED_ptr", "Delta_ptr"],
+    )
+    @triton.jit(
+        do_not_specialize=["M", "J_dim"],
+        do_not_specialize_on_alignment=[
+            "GO_ptr",
+            "W_ptr",
+            "O_ptr",
+            "G_ptr",
+            "DO_ptr",
+            "DG_ptr",
+            "GATED_ptr",
+            "Delta_ptr",
+        ],
+    )
+    def _linear_dx_gate_bwd_kernel(
+        GO_ptr,
+        W_ptr,
+        O_ptr,
+        G_ptr,
+        DO_ptr,
+        DG_ptr,
+        GATED_ptr,
+        Delta_ptr,
+        M,
+        J_dim,
+        N: tl.constexpr,
+        C: tl.constexpr,
+        H: tl.constexpr,
+        CH: tl.constexpr,
+        GEMM_MODE: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """``d_attn = GO @ W`` in registers, then gate backward."""
+        pid = tl.program_id(0)
+        offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_c = tl.arange(0, BLOCK_K)
+        m_mask = offs_m < M
+        c_mask = offs_c < C
+        acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+        for n0 in range(0, N, BLOCK_N):
+            offs_n = n0 + tl.arange(0, BLOCK_N)
+            n_mask = offs_n < N
+            go = tl.load(
+                GO_ptr + offs_m.to(tl.int64)[:, None] * N + offs_n[None, :],
+                mask=m_mask[:, None] & n_mask[None, :],
+                other=0.0,
+            )
+            w = tl.load(
+                W_ptr + offs_n[:, None] * C + offs_c[None, :],
+                mask=n_mask[:, None] & c_mask[None, :],
+                other=0.0,
+            )
+            acc += _dot_f32(go, w, GEMM_MODE)
+        o = tl.load(
+            O_ptr + offs_m.to(tl.int64)[:, None] * C + offs_c[None, :],
+            mask=m_mask[:, None] & c_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        g = tl.load(
+            G_ptr + offs_m.to(tl.int64)[:, None] * C + offs_c[None, :],
+            mask=m_mask[:, None] & c_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        sig = 1.0 / (1.0 + tl.exp(-g))
+        gated = o * sig
+        d_o = acc * sig
+        d_g = acc * o * sig * (1.0 - sig)
+        delta = tl.sum(
+            tl.reshape(d_o * o, (BLOCK_M, H, CH)),
+            axis=2,
+        )
+        offs_h = tl.arange(0, H)
+        offs_i = offs_m // J_dim
+        offs_j = offs_m - offs_i * J_dim
+        tl.store(
+            Delta_ptr
+            + (offs_i[:, None] * H + offs_h[None, :]) * J_dim
+            + offs_j[:, None],
+            delta,
+            mask=m_mask[:, None],
+        )
+        tl.store(
+            GATED_ptr + offs_m.to(tl.int64)[:, None] * C + offs_c[None, :],
+            gated.to(GATED_ptr.dtype.element_ty),
+            mask=m_mask[:, None] & c_mask[None, :],
+        )
+        tl.store(
+            DO_ptr + offs_m.to(tl.int64)[:, None] * C + offs_c[None, :],
+            d_o.to(DO_ptr.dtype.element_ty),
+            mask=m_mask[:, None] & c_mask[None, :],
+        )
+        tl.store(
+            DG_ptr + offs_m.to(tl.int64)[:, None] * C + offs_c[None, :],
+            d_g.to(DG_ptr.dtype.element_ty),
+            mask=m_mask[:, None] & c_mask[None, :],
+        )
+
 else:  # pragma: no cover
 
     def _unavailable(*_a, **_k):
@@ -1390,6 +1495,7 @@ else:  # pragma: no cover
     _linear_dx_kernel = _unavailable
     _cast_fp32_kernel = _unavailable
     _gate_bwd_kernel = _unavailable
+    _linear_dx_gate_bwd_kernel = _unavailable
 
 
 def _pair_ln_autotune_key(z, wz, ln_b, write_stats, mode):
@@ -2305,6 +2411,98 @@ def _gate_bwd(
     return d_o, d_g, gated, delta
 
 
+def _ensure_dx_gate_autotune(
+    go: torch.Tensor, wo: torch.Tensor, heads: int, ch: int
+) -> None:
+    key = (_gemm_mode(go), go.device.type, go.device.index, go.dtype, wo.shape[0], heads, ch)
+    if key in _dx_gate_autotune_ready:
+        return
+    m = _LINEAR_WARM_M
+    n = wo.shape[0]
+    c = heads * ch
+    j = 256
+    dummy_go = torch.empty((m, n), device=go.device, dtype=go.dtype)
+    dummy_w = torch.empty_like(wo)
+    dummy_o = torch.empty((m, c), device=go.device, dtype=go.dtype)
+    dummy_g = torch.empty_like(dummy_o)
+    dummy_do = torch.empty_like(dummy_o)
+    dummy_dg = torch.empty_like(dummy_o)
+    dummy_gated = torch.empty_like(dummy_o)
+    dummy_delta = torch.empty((m // j, heads, j), device=go.device, dtype=torch.float32)
+
+    def grid(meta):
+        return (triton.cdiv(m, meta["BLOCK_M"]),)
+
+    _linear_dx_gate_bwd_kernel[grid](
+        dummy_go,
+        dummy_w,
+        dummy_o,
+        dummy_g,
+        dummy_do,
+        dummy_dg,
+        dummy_gated,
+        dummy_delta,
+        m,
+        j,
+        N=n,
+        C=c,
+        H=heads,
+        CH=ch,
+        GEMM_MODE=_gemm_mode(go),
+        BLOCK_K=max(_next_power_of_two(c), 16),
+    )
+    _dx_gate_autotune_ready.add(key)
+
+
+def _linear_dx_gate_bwd(
+    go: torch.Tensor,
+    wo: torch.Tensor,
+    o: torch.Tensor,
+    g: torch.Tensor,
+    dg_out: torch.Tensor | None = None,
+):
+    """``d_attn = go @ Wo`` fused with gate backward. Does not store ``d_attn``."""
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("Triton is required for fused_tri_attn")
+    go = go if go.is_contiguous() else go.contiguous()
+    wo = wo if wo.is_contiguous() else wo.contiguous()
+    o = o if o.is_contiguous() else o.contiguous()
+    g = g if g.is_contiguous() else g.contiguous()
+    rows, j, heads, ch = o.shape
+    m, c = rows * j, heads * ch
+    o2 = o.reshape(m, c)
+    g2 = g.reshape(m, c)
+    d_o = torch.empty_like(o2)
+    d_g = dg_out.reshape(m, c) if dg_out is not None else torch.empty_like(g2)
+    gated = torch.empty_like(o2)
+    delta = torch.empty((rows, heads, j), device=o.device, dtype=torch.float32)
+    if m < _LINEAR_WARM_M:
+        _ensure_dx_gate_autotune(go, wo, heads, ch)
+
+    def grid(meta):
+        return (triton.cdiv(m, meta["BLOCK_M"]),)
+
+    _linear_dx_gate_bwd_kernel[grid](
+        go,
+        wo,
+        o2,
+        g2,
+        d_o,
+        d_g,
+        gated,
+        delta,
+        m,
+        j,
+        N=go.shape[1],
+        C=c,
+        H=heads,
+        CH=ch,
+        GEMM_MODE=_gemm_mode(go),
+        BLOCK_K=max(_next_power_of_two(c), 16),
+    )
+    return d_o, d_g, gated, delta
+
+
 def _row_block(n_i: int, chunk_size: int | None) -> int:
     if chunk_size is None:
         return min(n_i, _DEFAULT_ROW_BLOCK)
@@ -2531,9 +2729,8 @@ def _fused_tri_attn_backward(
         d_qkvg = torch.empty(
             (4, rows * n_j, c_in), device=z.device, dtype=z.dtype
         )
-        d_attn = _linear_dx(go_block, wo)
-        d_o, _, attn_gated, delta = _gate_bwd(
-            o, g, d_attn, dg_out=d_qkvg[3]
+        d_o, _, attn_gated, delta = _linear_dx_gate_bwd(
+            go_block, wo, o, g, dg_out=d_qkvg[3]
         )
         _split_m_dw(
             attn_gated,
