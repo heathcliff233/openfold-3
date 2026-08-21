@@ -1213,7 +1213,7 @@ if _TRITON_AVAILABLE:
 
     @triton.autotune(
         configs=_configs(_LINEAR_TILES, ("BLOCK_M", "BLOCK_N")),
-        key=["GEMM_MODE", "INPUT_SOA"],
+        key=["GEMM_MODE", "INPUT_SOA", "ACCUM_DX"],
         prune_configs_by={"early_config_prune": _prune_dw},
         restore_value=["DX_ptr"],
     )
@@ -1234,6 +1234,7 @@ if _TRITON_AVAILABLE:
         BLOCK_K: tl.constexpr,
         INPUT_SOA: tl.constexpr,
         GROUP_C: tl.constexpr,
+        ACCUM_DX: tl.constexpr,
     ):
         """``dX = dY @ W`` with packed ``dY[M,N]`` or SoA ``dY[N/GROUP_C, M, GROUP_C]``."""
         pid_m = tl.program_id(0)
@@ -1271,11 +1272,13 @@ if _TRITON_AVAILABLE:
                 other=0.0,
             )
             acc += _dot_f32(dy, w, GEMM_MODE)
-        tl.store(
-            DX_ptr + offs_m.to(tl.int64)[:, None] * K + offs_k[None, :],
-            acc.to(DX_ptr.dtype.element_ty),
-            mask=m_mask[:, None] & k_mask[None, :],
-        )
+        dx_ptr = DX_ptr + offs_m.to(tl.int64)[:, None] * K + offs_k[None, :]
+        tile = m_mask[:, None] & k_mask[None, :]
+        update = acc.to(DX_ptr.dtype.element_ty)
+        if ACCUM_DX:
+            prev = tl.load(dx_ptr, mask=tile, other=0.0).to(tl.float32)
+            update = (update.to(tl.float32) + prev).to(DX_ptr.dtype.element_ty)
+        tl.store(dx_ptr, update, mask=tile)
 
     @triton.jit(
         do_not_specialize=["N"],
@@ -2140,6 +2143,7 @@ def _ensure_linear_autotune(x: torch.Tensor, w: torch.Tensor, kind: str) -> None
                 BLOCK_K=block_k,
                 INPUT_SOA=True,
                 GROUP_C=group_c,
+                ACCUM_DX=False,
             )
         else:
             _linear_dx_kernel[grid](
@@ -2153,6 +2157,7 @@ def _ensure_linear_autotune(x: torch.Tensor, w: torch.Tensor, kind: str) -> None
                 BLOCK_K=block_k,
                 INPUT_SOA=False,
                 GROUP_C=1,
+                ACCUM_DX=kind == "dx_accum",
             )
     _linear_autotune_ready.add(key)
 
@@ -2218,7 +2223,13 @@ def _linear_fwd_soa(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return y
 
 
-def _linear_dx(dy: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+def _linear_dx(
+    dy: torch.Tensor,
+    w: torch.Tensor,
+    out: torch.Tensor | None = None,
+    *,
+    accumulate: bool = False,
+) -> torch.Tensor:
     """``dX = dY @ W`` with Triton ``GEMM_MODE``."""
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton is required for fused_tri_attn")
@@ -2226,9 +2237,11 @@ def _linear_dx(dy: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     w = w if w.is_contiguous() else w.contiguous()
     m, n = dy.shape
     k = w.shape[1]
-    dx = torch.empty((m, k), device=dy.device, dtype=dy.dtype)
+    dx = out.reshape(m, k) if out is not None else torch.empty(
+        (m, k), device=dy.device, dtype=dy.dtype
+    )
     if m < _LINEAR_WARM_M:
-        _ensure_linear_autotune(dy, w, "dx")
+        _ensure_linear_autotune(dy, w, "dx_accum" if accumulate else "dx")
 
     def grid(meta):
         return (triton.cdiv(m, meta["BLOCK_M"]),)
@@ -2244,11 +2257,18 @@ def _linear_dx(dy: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         BLOCK_K=max(_next_power_of_two(k), 16),
         INPUT_SOA=False,
         GROUP_C=1,
+        ACCUM_DX=accumulate,
     )
     return dx
 
 
-def _linear_dx_soa(dy: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+def _linear_dx_soa(
+    dy: torch.Tensor,
+    w: torch.Tensor,
+    out: torch.Tensor | None = None,
+    *,
+    accumulate: bool = False,
+) -> torch.Tensor:
     """``dX = dY @ W`` with SoA ``dY[4, M, C]`` and packed ``W[4C, K]``."""
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton is required for fused_tri_attn")
@@ -2257,7 +2277,9 @@ def _linear_dx_soa(dy: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     groups, m, group_c = dy.shape
     n = groups * group_c
     k = w.shape[1]
-    dx = torch.empty((m, k), device=dy.device, dtype=dy.dtype)
+    dx = out.reshape(m, k) if out is not None else torch.empty(
+        (m, k), device=dy.device, dtype=dy.dtype
+    )
     if m < _LINEAR_WARM_M:
         _ensure_linear_autotune(dy, w, "dx_soa")
 
@@ -2275,6 +2297,7 @@ def _linear_dx_soa(dy: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         BLOCK_K=max(_next_power_of_two(k), 16),
         INPUT_SOA=True,
         GROUP_C=group_c,
+        ACCUM_DX=accumulate,
     )
     return dx
 
@@ -2706,7 +2729,7 @@ def _fused_tri_attn_backward(
         mask_c = mask if mask.is_contiguous() else mask.contiguous()
         if mask_c.dim() == 3:
             mask_c = mask_c[0]
-    d_z_hat = torch.zeros_like(z_hat)
+    d_z_hat = torch.empty_like(z_hat)
     d_qkvg_w_partial = torch.empty(
         (_BWD_SPLIT_M, *w_qkvg.shape), device=z.device, dtype=torch.float32
     )
@@ -2762,15 +2785,23 @@ def _fused_tri_attn_backward(
             d_qkvg_w_partial,
             accumulate=start > 0,
         )
-        d_zn = _linear_dx_soa(d_qkvg, w_qkvg)
-        d_z_hat[0, start:end] += d_zn.view(rows, n_j, c_in)
-        del q, k, v, g, o, d_qkvg, d_zn
+        _linear_dx_soa(
+            d_qkvg,
+            w_qkvg,
+            out=d_z_hat[0, start:end],
+        )
+        del q, k, v, g, o, d_qkvg
     d_qkvg_w = d_qkvg_w_partial.sum(0)
     d_wo = d_wo_partial.sum(0)
     d_tb = d_tb_partial.sum(0)
     d_tb_flat = d_tb.permute(1, 2, 0).reshape(-1, heads).to(dtype=z.dtype)
     d_wz = _split_m_dw(z_hat.reshape(-1, c_in), d_tb_flat).sum(0)
-    d_z_hat = d_z_hat + _linear_dx(d_tb_flat, wz_d).view(1, n_i, n_j, c_in)
+    _linear_dx(
+        d_tb_flat,
+        wz_d,
+        out=d_z_hat.reshape(-1, c_in),
+        accumulate=True,
+    )
     d_z, d_ln_w, d_ln_b = _ln_bwd(
         z.reshape(-1, c_in),
         d_z_hat.reshape(-1, c_in),
