@@ -947,7 +947,7 @@ if _TRITON_AVAILABLE:
 
     @triton.autotune(
         configs=_configs(_DW_TILES, ("BLOCK_M", "BLOCK_N")),
-        key=["GEMM_MODE"],
+        key=["GEMM_MODE", "INPUT_SOA"],
         prune_configs_by={"early_config_prune": _prune_dw},
         restore_value=["P_ptr"],
     )
@@ -968,6 +968,8 @@ if _TRITON_AVAILABLE:
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
         ACCUM_P: tl.constexpr,
+        INPUT_SOA: tl.constexpr,
+        GROUP_C: tl.constexpr,
     ):
         split = tl.program_id(0)
         rows = (M + SPLIT_M - 1) // SPLIT_M
@@ -986,11 +988,26 @@ if _TRITON_AVAILABLE:
                 mask=m_mask[:, None] & k_mask[None, :],
                 other=0.0,
             )
-            go = tl.load(
-                GO_ptr + offs_m.to(tl.int64)[:, None] * N + offs_n[None, :],
-                mask=m_mask[:, None] & n_mask[None, :],
-                other=0.0,
-            )
+            if INPUT_SOA:
+                group = offs_n // GROUP_C
+                c = offs_n - group * GROUP_C
+                go = tl.load(
+                    GO_ptr
+                    + (
+                        group.to(tl.int64)[None, :] * M
+                        + offs_m.to(tl.int64)[:, None]
+                    )
+                    * GROUP_C
+                    + c[None, :],
+                    mask=m_mask[:, None] & n_mask[None, :],
+                    other=0.0,
+                )
+            else:
+                go = tl.load(
+                    GO_ptr + offs_m.to(tl.int64)[:, None] * N + offs_n[None, :],
+                    mask=m_mask[:, None] & n_mask[None, :],
+                    other=0.0,
+                )
             acc += _dot_f32(tl.trans(go), x, GEMM_MODE)
         p_ptr = P_ptr + split * N * K + offs_n[:, None] * K + offs_k[None, :]
         if ACCUM_P:
@@ -1195,7 +1212,7 @@ if _TRITON_AVAILABLE:
 
     @triton.autotune(
         configs=_configs(_LINEAR_TILES, ("BLOCK_M", "BLOCK_N")),
-        key=["GEMM_MODE"],
+        key=["GEMM_MODE", "INPUT_SOA"],
         prune_configs_by={"early_config_prune": _prune_dw},
         restore_value=["DX_ptr"],
     )
@@ -1214,8 +1231,10 @@ if _TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        INPUT_SOA: tl.constexpr,
+        GROUP_C: tl.constexpr,
     ):
-        """``dX = dY @ W`` with ``dY[M,N]``, ``W[N,K]``."""
+        """``dX = dY @ W`` with packed ``dY[M,N]`` or SoA ``dY[N/GROUP_C, M, GROUP_C]``."""
         pid_m = tl.program_id(0)
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_k = tl.arange(0, BLOCK_K)
@@ -1225,11 +1244,26 @@ if _TRITON_AVAILABLE:
         for n0 in range(0, N, BLOCK_N):
             offs_n = n0 + tl.arange(0, BLOCK_N)
             n_mask = offs_n < N
-            dy = tl.load(
-                DY_ptr + offs_m.to(tl.int64)[:, None] * N + offs_n[None, :],
-                mask=m_mask[:, None] & n_mask[None, :],
-                other=0.0,
-            )
+            if INPUT_SOA:
+                group = offs_n // GROUP_C
+                c = offs_n - group * GROUP_C
+                dy = tl.load(
+                    DY_ptr
+                    + (
+                        group.to(tl.int64)[None, :] * M
+                        + offs_m.to(tl.int64)[:, None]
+                    )
+                    * GROUP_C
+                    + c[None, :],
+                    mask=m_mask[:, None] & n_mask[None, :],
+                    other=0.0,
+                )
+            else:
+                dy = tl.load(
+                    DY_ptr + offs_m.to(tl.int64)[:, None] * N + offs_n[None, :],
+                    mask=m_mask[:, None] & n_mask[None, :],
+                    other=0.0,
+                )
             w = tl.load(
                 W_ptr + offs_n[:, None] * K + offs_k[None, :],
                 mask=n_mask[:, None] & k_mask[None, :],
@@ -1241,6 +1275,21 @@ if _TRITON_AVAILABLE:
             acc.to(DX_ptr.dtype.element_ty),
             mask=m_mask[:, None] & k_mask[None, :],
         )
+
+    @triton.jit(
+        do_not_specialize=["N"],
+        do_not_specialize_on_alignment=["SRC_ptr", "DST_ptr"],
+    )
+    def _cast_fp32_kernel(
+        SRC_ptr,
+        DST_ptr,
+        N,
+        BLOCK: tl.constexpr,
+    ):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < N
+        src = tl.load(SRC_ptr + offs, mask=mask, other=0.0)
+        tl.store(DST_ptr + offs, src.to(DST_ptr.dtype.element_ty), mask=mask)
 
     @triton.autotune(configs=_ln_configs(), key=[], restore_value=["DO_ptr"])
     @triton.jit(
@@ -1339,6 +1388,7 @@ else:  # pragma: no cover
     _ln_bwd_kernel = _unavailable
     _linear_fwd_kernel = _unavailable
     _linear_dx_kernel = _unavailable
+    _cast_fp32_kernel = _unavailable
     _gate_bwd_kernel = _unavailable
 
 
@@ -1735,6 +1785,9 @@ def _flash_bwd(
     mask_inf: float,
     *,
     accumulate_dtb: bool = False,
+    dq_out: torch.Tensor | None = None,
+    dk_out: torch.Tensor | None = None,
+    dv_out: torch.Tensor | None = None,
 ):
     q = q if q.is_contiguous() else q.contiguous()
     k = k if k.is_contiguous() else k.contiguous()
@@ -1742,9 +1795,14 @@ def _flash_bwd(
     do = do if do.is_contiguous() else do.contiguous()
     rows, j, heads, ch = q.shape
     split = min(_BWD_BIAS_SPLIT, max(rows, 1))
-    dq_acc = torch.empty((rows, j, heads, ch), device=q.device, dtype=torch.float32)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    use_dq_out = dq_out is not None and dq_out.dtype == torch.float32
+    dq_acc = (
+        dq_out
+        if use_dq_out
+        else torch.empty((rows, j, heads, ch), device=q.device, dtype=torch.float32)
+    )
+    dk = dk_out if dk_out is not None else torch.empty_like(k)
+    dv = dv_out if dv_out is not None else torch.empty_like(v)
     dummy = q
     mode = _gemm_mode(q)
     has_mask = mask is not None
@@ -1806,7 +1864,11 @@ def _flash_bwd(
         dv,
         **shared,
     )
-    dq = dq_acc if q.dtype == torch.float32 else dq_acc.to(dtype=q.dtype)
+    if dq_out is not None and dq_out.dtype != torch.float32:
+        _copy_cast(dq_acc, dq_out)
+        dq = dq_out
+    else:
+        dq = dq_acc
     return dq, dk, dv
 
 
@@ -1844,6 +1906,50 @@ def _split_m_dw(
         SPLIT_M=_BWD_SPLIT_M,
         BLOCK_K=min(_DW_BLOCK_K, max(_next_power_of_two(k), 16)),
         ACCUM_P=accumulate,
+        INPUT_SOA=False,
+        GROUP_C=1,
+    )
+    return partial
+
+
+def _split_m_dw_soa(
+    x: torch.Tensor,
+    go: torch.Tensor,
+    partial: torch.Tensor | None = None,
+    *,
+    accumulate: bool = False,
+) -> torch.Tensor:
+    """Exclusive split-M ``dW`` from SoA ``go[4, M, C]``."""
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("Triton is required for fused_tri_attn")
+    groups, m, group_c = go.shape
+    k = x.shape[1]
+    n = groups * group_c
+    if partial is None:
+        partial = torch.empty(
+            (_BWD_SPLIT_M, n, k), dtype=torch.float32, device=x.device
+        )
+
+    def grid(meta):
+        return (
+            _BWD_SPLIT_M,
+            triton.cdiv(n, meta["BLOCK_N"]),
+            triton.cdiv(k, _DW_BLOCK_K),
+        )
+
+    _split_m_dw_kernel[grid](
+        x.contiguous(),
+        go.contiguous(),
+        partial,
+        m,
+        K=k,
+        N=n,
+        GEMM_MODE=_gemm_mode(x),
+        SPLIT_M=_BWD_SPLIT_M,
+        BLOCK_K=min(_DW_BLOCK_K, max(_next_power_of_two(k), 16)),
+        ACCUM_P=accumulate,
+        INPUT_SOA=True,
+        GROUP_C=group_c,
     )
     return partial
 
@@ -1914,9 +2020,34 @@ def _ensure_linear_autotune(x: torch.Tensor, w: torch.Tensor, kind: str) -> None
         def grid(meta):
             return (triton.cdiv(m, meta["BLOCK_M"]),)
 
-        _linear_dx_kernel[grid](
-            dummy_y, dummy_w, dummy_x, m, K=k, N=n, GEMM_MODE=mode, BLOCK_K=block_k
-        )
+        if kind == "dx_soa":
+            group_c = n // 4
+            dummy_soa = torch.empty((4, m, group_c), device=x.device, dtype=x.dtype)
+            _linear_dx_kernel[grid](
+                dummy_soa,
+                dummy_w,
+                dummy_x,
+                m,
+                K=k,
+                N=n,
+                GEMM_MODE=mode,
+                BLOCK_K=block_k,
+                INPUT_SOA=True,
+                GROUP_C=group_c,
+            )
+        else:
+            _linear_dx_kernel[grid](
+                dummy_y,
+                dummy_w,
+                dummy_x,
+                m,
+                K=k,
+                N=n,
+                GEMM_MODE=mode,
+                BLOCK_K=block_k,
+                INPUT_SOA=False,
+                GROUP_C=1,
+            )
     _linear_autotune_ready.add(key)
 
 
@@ -2005,8 +2136,53 @@ def _linear_dx(dy: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         N=n,
         GEMM_MODE=_gemm_mode(dy),
         BLOCK_K=max(_next_power_of_two(k), 16),
+        INPUT_SOA=False,
+        GROUP_C=1,
     )
     return dx
+
+
+def _linear_dx_soa(dy: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """``dX = dY @ W`` with SoA ``dY[4, M, C]`` and packed ``W[4C, K]``."""
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("Triton is required for fused_tri_attn")
+    dy = dy if dy.is_contiguous() else dy.contiguous()
+    w = w if w.is_contiguous() else w.contiguous()
+    groups, m, group_c = dy.shape
+    n = groups * group_c
+    k = w.shape[1]
+    dx = torch.empty((m, k), device=dy.device, dtype=dy.dtype)
+    if m < _LINEAR_WARM_M:
+        _ensure_linear_autotune(dy, w, "dx_soa")
+
+    def grid(meta):
+        return (triton.cdiv(m, meta["BLOCK_M"]),)
+
+    _linear_dx_kernel[grid](
+        dy,
+        w,
+        dx,
+        m,
+        K=k,
+        N=n,
+        GEMM_MODE=_gemm_mode(dy),
+        BLOCK_K=max(_next_power_of_two(k), 16),
+        INPUT_SOA=True,
+        GROUP_C=group_c,
+    )
+    return dx
+
+
+def _copy_cast(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    """Triton copy that downcasts fp32 ``src`` into ``dst``."""
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("Triton is required for fused_tri_attn")
+    src = src.reshape(-1).contiguous()
+    out = dst.reshape(-1)
+    n = src.numel()
+    block = 1024
+    _cast_fp32_kernel[(triton.cdiv(n, block),)](src, out, n, BLOCK=block)
+    return dst
 
 
 def _ln_apply(
@@ -2086,7 +2262,12 @@ def _ln_bwd(
     return dx, d_gamma, d_beta
 
 
-def _gate_bwd(o: torch.Tensor, g: torch.Tensor, d_attn: torch.Tensor):
+def _gate_bwd(
+    o: torch.Tensor,
+    g: torch.Tensor,
+    d_attn: torch.Tensor,
+    dg_out: torch.Tensor | None = None,
+):
     """``sig = σ(g)``; write gated ``O``, ``dO``, ``dG``, and flash ``delta``."""
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton is required for fused_tri_attn")
@@ -2099,7 +2280,7 @@ def _gate_bwd(o: torch.Tensor, g: torch.Tensor, d_attn: torch.Tensor):
     g2 = g.reshape(m, c)
     da2 = d_attn.reshape(m, c)
     d_o = torch.empty_like(o2)
-    d_g = torch.empty_like(g2)
+    d_g = dg_out.reshape(m, c) if dg_out is not None else torch.empty_like(g2)
     gated = torch.empty_like(o2)
     delta = torch.empty((rows, heads, j), device=o.device, dtype=torch.float32)
 
@@ -2347,15 +2528,20 @@ def _fused_tri_attn_backward(
         q, k, v, g = _project_qkvg(zn, w_qkvg, heads, ch)
         o = o_ungated[start:end]
         go_block = go[0, start:end].reshape(rows * n_j, c_in)
+        d_qkvg = torch.empty(
+            (4, rows * n_j, c_in), device=z.device, dtype=z.dtype
+        )
         d_attn = _linear_dx(go_block, wo)
-        d_o, d_g_pre, attn_gated, delta = _gate_bwd(o, g, d_attn)
+        d_o, _, attn_gated, delta = _gate_bwd(
+            o, g, d_attn, dg_out=d_qkvg[3]
+        )
         _split_m_dw(
             attn_gated,
             go_block,
             d_wo_partial,
             accumulate=start > 0,
         )
-        dq, dk, dv = _flash_bwd(
+        _flash_bwd(
             q,
             k,
             v,
@@ -2369,19 +2555,19 @@ def _fused_tri_attn_backward(
             scale,
             inf,
             accumulate_dtb=start > 0,
+            dq_out=d_qkvg[0].view(rows, n_j, heads, ch),
+            dk_out=d_qkvg[1].view(rows, n_j, heads, ch),
+            dv_out=d_qkvg[2].view(rows, n_j, heads, ch),
         )
-        d_qkvg = torch.stack(
-            [dq, dk, dv, d_g_pre.view(rows, n_j, heads, ch)], dim=2
-        ).reshape(rows * n_j, 4 * heads * ch)
-        _split_m_dw(
+        _split_m_dw_soa(
             zn.reshape(rows * n_j, c_in),
             d_qkvg,
             d_qkvg_w_partial,
             accumulate=start > 0,
         )
-        d_zn = _linear_dx(d_qkvg, w_qkvg)
+        d_zn = _linear_dx_soa(d_qkvg, w_qkvg)
         d_z_hat[0, start:end] += d_zn.view(rows, n_j, c_in)
-        del q, k, v, g, o, dq, dk, dv, d_qkvg, d_zn
+        del q, k, v, g, o, d_qkvg, d_zn
     d_qkvg_w = d_qkvg_w_partial.sum(0)
     d_wo = d_wo_partial.sum(0)
     d_tb = d_tb_partial.sum(0)
