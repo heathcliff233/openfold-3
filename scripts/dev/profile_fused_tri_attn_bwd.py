@@ -168,7 +168,6 @@ def _install(timer: _Timer):
     fta._linear_dx = _wrap(timer, fta._linear_dx, "linear_dx")
     fta._linear_dx_soa = _wrap(timer, fta._linear_dx_soa, "linear_dx_soa")
     fta._linear_dx_gate_bwd = _wrap(timer, fta._linear_dx_gate_bwd, "dx_gate_bwd")
-    fta._gate_bwd = _wrap(timer, fta._gate_bwd, "gate_bwd")
     fta._split_m_dw = _wrap(timer, fta._split_m_dw, "split_m_dw")
     fta._split_m_dw_soa = _wrap(timer, fta._split_m_dw_soa, "split_m_dw_soa")
     fta._ln_bwd = _wrap(timer, fta._ln_bwd, "ln_bwd")

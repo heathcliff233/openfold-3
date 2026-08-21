@@ -1145,7 +1145,7 @@ if _TRITON_AVAILABLE:
 
     @triton.autotune(
         configs=_configs(_LINEAR_TILES, ("BLOCK_M", "BLOCK_N")),
-        key=["GEMM_MODE", "OUTPUT_SOA"],
+        key=["GEMM_MODE"],
         prune_configs_by={"early_config_prune": _prune_dw},
         restore_value=["Y_ptr"],
     )
@@ -1164,13 +1164,9 @@ if _TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
-        OUTPUT_SOA: tl.constexpr,
         GROUP_C: tl.constexpr,
     ):
-        """``Y = X @ W^T`` with ``X[M,K]``, ``W[N,K]``.
-
-        Packed store is ``[M, N]``. SoA store is ``[N/GROUP_C, M, GROUP_C]``.
-        """
+        """``Y = X @ W^T`` stored as SoA ``[N/GROUP_C, M, GROUP_C]``."""
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -1192,24 +1188,16 @@ if _TRITON_AVAILABLE:
                 other=0.0,
             )
             acc += _dot_f32(x, tl.trans(w), GEMM_MODE)
-        y = acc.to(Y_ptr.dtype.element_ty)
-        if OUTPUT_SOA:
-            group = offs_n // GROUP_C
-            c = offs_n - group * GROUP_C
-            tl.store(
-                Y_ptr
-                + (group.to(tl.int64)[None, :] * M + offs_m.to(tl.int64)[:, None])
-                * GROUP_C
-                + c[None, :],
-                y,
-                mask=m_mask[:, None] & n_mask[None, :],
-            )
-        else:
-            tl.store(
-                Y_ptr + offs_m.to(tl.int64)[:, None] * N + offs_n[None, :],
-                y,
-                mask=m_mask[:, None] & n_mask[None, :],
-            )
+        group = offs_n // GROUP_C
+        c = offs_n - group * GROUP_C
+        tl.store(
+            Y_ptr
+            + (group.to(tl.int64)[None, :] * M + offs_m.to(tl.int64)[:, None])
+            * GROUP_C
+            + c[None, :],
+            acc.to(Y_ptr.dtype.element_ty),
+            mask=m_mask[:, None] & n_mask[None, :],
+        )
 
     @triton.autotune(
         configs=_configs(_LINEAR_TILES, ("BLOCK_M", "BLOCK_N")),
@@ -1294,89 +1282,6 @@ if _TRITON_AVAILABLE:
         mask = offs < N
         src = tl.load(SRC_ptr + offs, mask=mask, other=0.0)
         tl.store(DST_ptr + offs, src.to(DST_ptr.dtype.element_ty), mask=mask)
-
-    @triton.autotune(configs=_ln_configs(), key=[], restore_value=["DO_ptr"])
-    @triton.jit(
-        do_not_specialize=["M"],
-        do_not_specialize_on_alignment=[
-            "O_ptr",
-            "G_ptr",
-            "DATT_ptr",
-            "DO_ptr",
-            "DG_ptr",
-            "GATED_ptr",
-            "Delta_ptr",
-        ],
-    )
-    def _gate_bwd_kernel(
-        O_ptr,
-        G_ptr,
-        DATT_ptr,
-        DO_ptr,
-        DG_ptr,
-        GATED_ptr,
-        Delta_ptr,
-        M,
-        J_dim,
-        C: tl.constexpr,
-        H: tl.constexpr,
-        CH: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_K: tl.constexpr,
-    ):
-        pid = tl.program_id(0)
-        offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_c = tl.arange(0, BLOCK_K)
-        m_mask = offs_m < M
-        c_mask = offs_c < C
-        o = tl.load(
-            O_ptr + offs_m.to(tl.int64)[:, None] * C + offs_c[None, :],
-            mask=m_mask[:, None] & c_mask[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        g = tl.load(
-            G_ptr + offs_m.to(tl.int64)[:, None] * C + offs_c[None, :],
-            mask=m_mask[:, None] & c_mask[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        datt = tl.load(
-            DATT_ptr + offs_m.to(tl.int64)[:, None] * C + offs_c[None, :],
-            mask=m_mask[:, None] & c_mask[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        sig = 1.0 / (1.0 + tl.exp(-g))
-        gated = o * sig
-        d_o = datt * sig
-        d_g = datt * o * sig * (1.0 - sig)
-        delta = tl.sum(
-            tl.reshape(d_o * o, (BLOCK_M, H, CH)),
-            axis=2,
-        )
-        offs_h = tl.arange(0, H)
-        offs_i = offs_m // J_dim
-        offs_j = offs_m - offs_i * J_dim
-        tl.store(
-            Delta_ptr
-            + (offs_i[:, None] * H + offs_h[None, :]) * J_dim
-            + offs_j[:, None],
-            delta,
-            mask=m_mask[:, None],
-        )
-        tl.store(
-            GATED_ptr + offs_m.to(tl.int64)[:, None] * C + offs_c[None, :],
-            gated.to(GATED_ptr.dtype.element_ty),
-            mask=m_mask[:, None] & c_mask[None, :],
-        )
-        tl.store(
-            DO_ptr + offs_m.to(tl.int64)[:, None] * C + offs_c[None, :],
-            d_o.to(DO_ptr.dtype.element_ty),
-            mask=m_mask[:, None] & c_mask[None, :],
-        )
-        tl.store(
-            DG_ptr + offs_m.to(tl.int64)[:, None] * C + offs_c[None, :],
-            d_g.to(DG_ptr.dtype.element_ty),
-            mask=m_mask[:, None] & c_mask[None, :],
-        )
 
     @triton.autotune(
         configs=_configs(_LINEAR_TILES, ("BLOCK_M", "BLOCK_N")),
@@ -1497,7 +1402,6 @@ else:  # pragma: no cover
     _linear_fwd_kernel = _unavailable
     _linear_dx_kernel = _unavailable
     _cast_fp32_kernel = _unavailable
-    _gate_bwd_kernel = _unavailable
     _linear_dx_gate_bwd_kernel = _unavailable
 
 
@@ -2088,24 +1992,7 @@ def _ensure_linear_autotune(x: torch.Tensor, w: torch.Tensor, kind: str) -> None
     dummy_y = torch.empty((m, n), device=x.device, dtype=x.dtype)
     mode = _gemm_mode(x)
     block_k = max(_next_power_of_two(k), 16)
-    if kind == "fwd":
-
-        def grid(meta):
-            return (triton.cdiv(m, meta["BLOCK_M"]), triton.cdiv(n, meta["BLOCK_N"]))
-
-        _linear_fwd_kernel[grid](
-            dummy_x,
-            dummy_w,
-            dummy_y,
-            m,
-            K=k,
-            N=n,
-            GEMM_MODE=mode,
-            BLOCK_K=block_k,
-            OUTPUT_SOA=False,
-            GROUP_C=1,
-        )
-    elif kind == "fwd_soa":
+    if kind == "fwd_soa":
         group_c = n // 4
         dummy_soa = torch.empty((4, m, group_c), device=x.device, dtype=x.dtype)
 
@@ -2121,7 +2008,6 @@ def _ensure_linear_autotune(x: torch.Tensor, w: torch.Tensor, kind: str) -> None
             N=n,
             GEMM_MODE=mode,
             BLOCK_K=block_k,
-            OUTPUT_SOA=True,
             GROUP_C=group_c,
         )
     else:
@@ -2162,36 +2048,6 @@ def _ensure_linear_autotune(x: torch.Tensor, w: torch.Tensor, kind: str) -> None
     _linear_autotune_ready.add(key)
 
 
-def _linear_fwd(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """``Y = X @ W^T`` with Triton ``GEMM_MODE``."""
-    if not _TRITON_AVAILABLE:
-        raise RuntimeError("Triton is required for fused_tri_attn")
-    x = x if x.is_contiguous() else x.contiguous()
-    w = w if w.is_contiguous() else w.contiguous()
-    m, k = x.shape
-    n = w.shape[0]
-    y = torch.empty((m, n), device=x.device, dtype=x.dtype)
-    if m < _LINEAR_WARM_M:
-        _ensure_linear_autotune(x, w, "fwd")
-
-    def grid(meta):
-        return (triton.cdiv(m, meta["BLOCK_M"]), triton.cdiv(n, meta["BLOCK_N"]))
-
-    _linear_fwd_kernel[grid](
-        x,
-        w,
-        y,
-        m,
-        K=k,
-        N=n,
-        GEMM_MODE=_gemm_mode(x),
-        BLOCK_K=max(_next_power_of_two(k), 16),
-        OUTPUT_SOA=False,
-        GROUP_C=1,
-    )
-    return y
-
-
 def _linear_fwd_soa(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """``Y = X @ W^T`` stored as ``[4, M, N/4]`` for rematerialized QKVG."""
     if not _TRITON_AVAILABLE:
@@ -2217,7 +2073,6 @@ def _linear_fwd_soa(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         N=n,
         GEMM_MODE=_gemm_mode(x),
         BLOCK_K=max(_next_power_of_two(k), 16),
-        OUTPUT_SOA=True,
         GROUP_C=group_c,
     )
     return y
@@ -2266,8 +2121,6 @@ def _linear_dx_soa(
     dy: torch.Tensor,
     w: torch.Tensor,
     out: torch.Tensor | None = None,
-    *,
-    accumulate: bool = False,
 ) -> torch.Tensor:
     """``dX = dY @ W`` with SoA ``dY[4, M, C]`` and packed ``W[4C, K]``."""
     if not _TRITON_AVAILABLE:
@@ -2297,7 +2150,7 @@ def _linear_dx_soa(
         BLOCK_K=max(_next_power_of_two(k), 16),
         INPUT_SOA=True,
         GROUP_C=group_c,
-        ACCUM_DX=accumulate,
+        ACCUM_DX=False,
     )
     return dx
 
@@ -2389,49 +2242,6 @@ def _ln_bwd(
     d_gamma = p_gamma.sum(0).to(dtype=gamma.dtype)
     d_beta = None if beta is None else p_beta.sum(0).to(dtype=beta.dtype)
     return dx, d_gamma, d_beta
-
-
-def _gate_bwd(
-    o: torch.Tensor,
-    g: torch.Tensor,
-    d_attn: torch.Tensor,
-    dg_out: torch.Tensor | None = None,
-):
-    """``sig = σ(g)``; write gated ``O``, ``dO``, ``dG``, and flash ``delta``."""
-    if not _TRITON_AVAILABLE:
-        raise RuntimeError("Triton is required for fused_tri_attn")
-    o = o if o.is_contiguous() else o.contiguous()
-    g = g if g.is_contiguous() else g.contiguous()
-    d_attn = d_attn if d_attn.is_contiguous() else d_attn.contiguous()
-    rows, j, heads, ch = o.shape
-    m, c = rows * j, heads * ch
-    o2 = o.reshape(m, c)
-    g2 = g.reshape(m, c)
-    da2 = d_attn.reshape(m, c)
-    d_o = torch.empty_like(o2)
-    d_g = dg_out.reshape(m, c) if dg_out is not None else torch.empty_like(g2)
-    gated = torch.empty_like(o2)
-    delta = torch.empty((rows, heads, j), device=o.device, dtype=torch.float32)
-
-    def grid(meta):
-        return (triton.cdiv(m, meta["BLOCK_M"]),)
-
-    _gate_bwd_kernel[grid](
-        o2,
-        g2,
-        da2,
-        d_o,
-        d_g,
-        gated,
-        delta,
-        m,
-        j,
-        C=c,
-        H=heads,
-        CH=ch,
-        BLOCK_K=max(_next_power_of_two(c), 16),
-    )
-    return d_o, d_g, gated, delta
 
 
 def _ensure_dx_gate_autotune(
