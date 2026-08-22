@@ -563,7 +563,11 @@ def _launch_fused_swiglu_transition(
     if beta is not None:
         beta = beta.contiguous()
 
-    in_place = residual_2d is not None and residual_2d.data_ptr() == x_2d.data_ptr()
+    in_place = (
+        residual_2d is not None
+        and residual_2d.data_ptr() == x_2d.data_ptr()
+        and not residual_2d.requires_grad
+    )
     if save_acts and in_place:
         raise RuntimeError("fused SwiGLU training forward cannot write in place")
     y = (

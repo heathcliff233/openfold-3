@@ -1873,7 +1873,9 @@ def _launch_fused_trimul(
     inplace = (
         residual is not None
         and residual.data_ptr() == z_c.data_ptr()
+        and not return_acts
         and not torch.is_grad_enabled()
+        and not residual.requires_grad
     )
     out = z_c if inplace else None
     resid = z_c if residual is not None else None

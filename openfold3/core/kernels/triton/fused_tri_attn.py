@@ -2439,7 +2439,16 @@ def _launch_fused_tri_attn(
     tb, mean, rstd = _pair_ln_linear(z, ln_w, ln_b, wz, eps, write_stats=write_stats)
     w_qkvg = torch.cat([wq, wk, wv, wg], dim=0)
     wo_d = _downcast_masters(z.dtype, wo)[0]
-    residual_wv = residual
+    # Autograd Function.forward runs under no_grad, so is_grad_enabled() is
+    # not a safe inplace guard. Training rematerializes from saved z and
+    # must not write z + update into that storage. Mini-rollout is also
+    # no_grad while the trunk pair still requires grad.
+    can_inplace = (
+        residual is not None
+        and not return_acts
+        and not residual.requires_grad
+    )
+    residual_wv = residual if can_inplace else None
     if residual_wv is not None:
         out = residual_wv
     else:
@@ -2485,7 +2494,12 @@ def _launch_fused_tri_attn(
         del q, k, v, g, o
     del w_qkvg
     if residual is not None:
-        y = residual if starting else residual.transpose(-2, -3)
+        if return_acts or residual_wv is None:
+            y = residual + out
+        else:
+            y = residual
+        if not starting:
+            y = y.transpose(-2, -3)
     else:
         y = out if starting else out.transpose(-2, -3)
     if not return_acts:
