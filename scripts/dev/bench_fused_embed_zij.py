@@ -30,7 +30,9 @@ from openfold3.core.kernels.triton.fused_embed_zij import (  # noqa: E402
     eager_embed_zij,
     fused_embed_zij,
 )
-from openfold3.core.kernels.triton.fused_relpos_embed import _build_indices  # noqa: E402
+from openfold3.core.kernels.triton.fused_relpos_embed import (  # noqa: E402
+    _build_indices,
+)
 
 C_Z = 128
 C_IN = 267

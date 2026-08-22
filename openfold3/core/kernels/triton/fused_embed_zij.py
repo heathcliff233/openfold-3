@@ -403,7 +403,9 @@ def eager_embed_zij(
     max_relative_chain: int,
     eps: float = 1e-5,
 ) -> torch.Tensor:
-    feats = relpos_complex(batch, max_relative_idx, max_relative_chain).to(dtype=z.dtype)
+    feats = relpos_complex(batch, max_relative_idx, max_relative_chain).to(
+        dtype=z.dtype
+    )
     return eager_ln_linear(
         torch.cat([z, feats], dim=-1), gamma, None, weight, None, eps
     )
@@ -520,9 +522,7 @@ def _fused_embed_zij_backward(
             (n_partial, K), dtype=torch.float32, device=z_2d.device
         )
         partial_beta = torch.empty_like(partial_gamma)
-        _fused_embed_zij_bwd_dx_kernel[
-            lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
-        ](
+        _fused_embed_zij_bwd_dx_kernel[lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)](
             z_2d,
             weight,
             grad_out_2d,
@@ -550,7 +550,9 @@ def _fused_embed_zij_backward(
 
 class _FusedEmbedZijFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, z, gamma, weight, idx1, idx2, idx3, same_entity, entity_offset, eps):
+    def forward(
+        ctx, z, gamma, weight, idx1, idx2, idx3, same_entity, entity_offset, eps
+    ):
         z_2d = z.contiguous().view(-1, z.shape[-1])
         y_2d, mean, rstd = _launch_fused_embed_zij(
             z_2d,
@@ -563,7 +565,9 @@ class _FusedEmbedZijFn(torch.autograd.Function):
             int(entity_offset),
             eps,
         )
-        ctx.save_for_backward(z, gamma, weight, mean, rstd, idx1, idx2, idx3, same_entity)
+        ctx.save_for_backward(
+            z, gamma, weight, mean, rstd, idx1, idx2, idx3, same_entity
+        )
         ctx.entity_offset = int(entity_offset)
         ctx.z_shape = z.shape
         return y_2d.view(*z.shape[:-1], weight.shape[0])
@@ -588,7 +592,11 @@ class _FusedEmbedZijFn(torch.autograd.Function):
             compute_dx=need[0] or need[1],
             compute_dw=bool(need[2]),
         )
-        dz = gx[:, : z.shape[-1]].to(dtype=z.dtype).view(ctx.z_shape) if need[0] else None
+        dz = (
+            gx[:, : z.shape[-1]].to(dtype=z.dtype).view(ctx.z_shape)
+            if need[0]
+            else None
+        )
         return (
             dz,
             dgamma.to(dtype=gamma.dtype) if need[1] else None,

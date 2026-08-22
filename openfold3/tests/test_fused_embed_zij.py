@@ -114,7 +114,9 @@ def test_autograd_matches_eager_tf32():
     _set_tf32(True)
     gamma, weight, z, batch, idx1, idx2, idx3, same, offset = _pair()
     leaves_e = [t.detach().requires_grad_(True) for t in (z, gamma, weight)]
-    y_e = eager_embed_zij(leaves_e[0], leaves_e[1], leaves_e[2], batch, MAX_REL, MAX_CHAIN)
+    y_e = eager_embed_zij(
+        leaves_e[0], leaves_e[1], leaves_e[2], batch, MAX_REL, MAX_CHAIN
+    )
     y_e.square().mean().backward()
     grads_ref = [t.grad.detach().clone() for t in leaves_e]
     leaves = [t.detach().requires_grad_(True) for t in (z, gamma, weight)]
@@ -153,9 +155,12 @@ def test_module_wrapper_matches_eager_when_disabled(monkeypatch):
         monkeypatch.setenv("OPENFOLD3_FUSED_LN_LINEAR", "0")
         y_eager = module._embed_zij(batch, z)
     torch.testing.assert_close(y_fused, y_eager, atol=1e-5, rtol=1e-5)
-    assert try_fused_embed_zij(
-        z, batch, module.layer_norm_z, module.linear_z, MAX_REL, MAX_CHAIN
-    ) is None
+    assert (
+        try_fused_embed_zij(
+            z, batch, module.layer_norm_z, module.linear_z, MAX_REL, MAX_CHAIN
+        )
+        is None
+    )
 
 
 def test_compile_reuse_across_lengths():

@@ -101,8 +101,12 @@ def bench_inference(N: int, precision: str) -> dict:
             "rel_err": rel_err,
             "eager_ms": _time(lambda: eager_ln_linear(x, gamma, None, weight, None)),
             "fused_ms": _time(lambda: fused_ln_linear(x, gamma, None, weight, None)),
-            "eager_U": _peak_U(lambda: eager_ln_linear(x, gamma, None, weight, None), N),
-            "fused_U": _peak_U(lambda: fused_ln_linear(x, gamma, None, weight, None), N),
+            "eager_U": _peak_U(
+                lambda: eager_ln_linear(x, gamma, None, weight, None), N
+            ),
+            "fused_U": _peak_U(
+                lambda: fused_ln_linear(x, gamma, None, weight, None), N
+            ),
         }
 
 

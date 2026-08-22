@@ -312,9 +312,7 @@ if _TRITON_AVAILABLE:
         dx_hat = dx_ln * gamma[None, :]
         grad_mean = tl.sum(dx_hat, axis=1) / K
         grad_proj = tl.sum(dx_hat * x_norm, axis=1) / K
-        gx = rstd[:, None] * (
-            dx_hat - grad_mean[:, None] - x_norm * grad_proj[:, None]
-        )
+        gx = rstd[:, None] * (dx_hat - grad_mean[:, None] - x_norm * grad_proj[:, None])
         _store2d(GX_ptr, gx, offs_m64, offs_k, stride_gx_m, m_mask, k_mask)
         pid = tl.program_id(0)
         tl.store(
@@ -578,6 +576,18 @@ def _next_power_of_two(n: int) -> int:
     return 1 if n <= 1 else 1 << (n - 1).bit_length()
 
 
+def _unused_ptr(ref: torch.Tensor) -> torch.Tensor:
+    """Throwaway buffer so unused kernel args never alias a live graph tensor.
+
+    Triton autotune ``restore_value`` does ``tensor.copy_(clone)`` on every
+    listed pointer. Production LN→Linear has no Linear bias, so the old
+    ``dummy = x`` made ``PB_ptr`` the pair activation and bumped its version
+    (~10² times) during ``dW`` autotune. Pairformer checkpoint then failed
+    to unpack the trunk pair.
+    """
+    return ref.new_empty(1)
+
+
 def _launch_fused_ln_linear(
     x_2d: torch.Tensor,
     gamma: torch.Tensor,
@@ -593,7 +603,7 @@ def _launch_fused_ln_linear(
     y = torch.empty((M, N), dtype=x_2d.dtype, device=x_2d.device)
     mean = torch.empty(M, dtype=torch.float32, device=x_2d.device)
     rstd = torch.empty_like(mean)
-    dummy = x_2d
+    dummy = _unused_ptr(x_2d)
     _fused_ln_linear_fwd_kernel[(lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),))](
         x_2d,
         weight,
@@ -642,7 +652,7 @@ def _fused_ln_linear_backward(
     x_c = x_2d.contiguous()
     go_c = grad_out_2d.contiguous()
     w_c = weight.contiguous()
-    dummy = x_c
+    dummy = _unused_ptr(x_c)
     gemm_mode = _gemm_mode(x_c)
     block_k = max(_next_power_of_two(K), 16)
     has_beta = beta is not None
@@ -690,9 +700,7 @@ def _fused_ln_linear_backward(
             (n_partial, K), dtype=torch.float32, device=x_c.device
         )
         partial_beta = torch.zeros_like(partial_gamma)
-        _fused_ln_linear_bwd_dx_kernel[
-            lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
-        ](
+        _fused_ln_linear_bwd_dx_kernel[lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)](
             x_c,
             w_c,
             go_c,

@@ -23,6 +23,7 @@ import tempfile
 
 import pytest
 import torch
+import torch.utils.checkpoint
 
 import openfold3.tests.utils.compare_utils as compare_utils
 from openfold3.core.kernels.triton.fused_ln_linear import (
@@ -42,7 +43,9 @@ pytestmark = [
 C_IN, C_OUT, N_TOKEN = 267, 128, 64
 
 
-def _weights(c_in=C_IN, c_out=C_OUT, dtype=torch.float32, ln_bias=False, lin_bias=False):
+def _weights(
+    c_in=C_IN, c_out=C_OUT, dtype=torch.float32, ln_bias=False, lin_bias=False
+):
     torch.manual_seed(0)
     gamma = torch.randn(c_in, dtype=dtype, device="cuda")
     beta = torch.randn(c_in, dtype=dtype, device="cuda") if ln_bias else None
@@ -51,7 +54,9 @@ def _weights(c_in=C_IN, c_out=C_OUT, dtype=torch.float32, ln_bias=False, lin_bia
     return gamma, beta, weight, bias
 
 
-def _pair(c_in=C_IN, c_out=C_OUT, n_token=N_TOKEN, act_dtype=torch.float32, w_dtype=None):
+def _pair(
+    c_in=C_IN, c_out=C_OUT, n_token=N_TOKEN, act_dtype=torch.float32, w_dtype=None
+):
     w_dtype = act_dtype if w_dtype is None else w_dtype
     gamma, beta, weight, bias = _weights(c_in, c_out, w_dtype)
     x = torch.randn(1, n_token, n_token, c_in, dtype=act_dtype, device="cuda") * 0.5
@@ -88,7 +93,9 @@ def test_fused_tf32_matches_eager_tf32():
 
 def test_fused_bf16_mixed_matches_eager_mixed():
     _set_tf32(False)
-    gamma, beta, weight, bias, x = _pair(act_dtype=torch.bfloat16, w_dtype=torch.float32)
+    gamma, beta, weight, bias, x = _pair(
+        act_dtype=torch.bfloat16, w_dtype=torch.float32
+    )
     with torch.inference_mode():
         y_fused = fused_ln_linear(x, gamma, beta, weight, bias)
         y_ref = eager_ln_linear(x, gamma, beta, weight, bias)
@@ -180,6 +187,39 @@ def test_autograd_optional_biases_match_eager():
     torch.testing.assert_close(y, y_e, atol=1e-5, rtol=1e-5)
     for act, ref in zip(leaves, grads_ref):
         torch.testing.assert_close(act.grad, ref, atol=5e-4, rtol=2e-4)
+
+
+def test_backward_does_not_bump_input_version():
+    """Unused bias restore must not inplace-copy the pair (checkpoint unpack)."""
+    _set_tf32(False)
+    gamma, _, weight, _, x = _pair(
+        n_token=64, act_dtype=torch.bfloat16, w_dtype=torch.float32
+    )
+    x = x.detach().requires_grad_(True)
+    x = x + 0
+    assert x._version == 0
+    y = fused_ln_linear(
+        x, gamma.requires_grad_(True), None, weight.requires_grad_(True), None
+    )
+    y.square().mean().backward()
+    assert x._version == 0
+
+
+def test_checkpoint_unpack_survives_fused_backward():
+    _set_tf32(False)
+    gamma, _, weight, _, x = _pair(
+        n_token=64, act_dtype=torch.bfloat16, w_dtype=torch.float32
+    )
+    x = x.detach().requires_grad_(True)
+
+    def trunk(t):
+        return t + t * 0.1
+
+    z = torch.utils.checkpoint.checkpoint(trunk, x, use_reentrant=False)
+    y = fused_ln_linear(
+        z, gamma.requires_grad_(True), None, weight.requires_grad_(True), None
+    )
+    (y.float().sum() + z.float().sum()).backward()
 
 
 def test_weight_gradients_are_deterministic():
