@@ -182,7 +182,7 @@ OPENFOLD3_FUSED_TRI_ATTN_V1=0
 
 # Fused diffusion attention
 
-Token-level `AttentionPairBias` in `DiffusionTransformer` (AdaLN, self-attention, `c_a=768`, `c_hidden=48`, `H=16`) can run as a length-generic Triton flash kernel instead of materializing `[B, S, H, N, N]` scores. Inference streams `LN_z → Linear_z` in Q-row blocks so the live pair-bias tile is `[H, ROW, N]` rather than `[H, N, N]`, projects Q per row, and fuses gate / `W_o` on that slice. AdaLN and ada-out stay on the eager module. `N_Q` / `N_K` / `S` / strides are not specialize keys. One program owns a `(b, s, h)` Q-tile.
+Token-level `AttentionPairBias` in `DiffusionTransformer` (AdaLN, self-attention, `c_a=768`, `c_hidden=48`, `H=16`) can run as a length-generic Triton flash kernel instead of materializing `[B, S, H, N, N]` scores. Inference projects pair bias with 3a `LN_z → Linear_z` from a packed view of `z` (no `z` row clone). The live pair tensor is `[H, N, N]` = 0.125U. Q/K/V keep their native strides. AdaLN and ada-out stay on the eager module. `N_Q` / `N_K` / `S` / strides are not specialize keys. One program owns a `(b, s, h)` Q-tile.
 
 Under training, an autograd wrapper saves `LSE` and rematerializes scores. `dQ` loops `S` in one exclusive `(b, h)` program so `dBias` accumulates into `[B, S_pb, H, N_Q, N_K]` — no `[B, S, H, N, N]` scratch and no atomics. Pair-bias `LN_z → Linear_z` uses the Phase 3a `fused_ln_linear` dispatcher when eligible.
 
@@ -196,9 +196,9 @@ On CUDA with `[B, S, N, C]` query data, self-attention, two biases, `float32` or
 
 - `ieee` — fp32 activations and `torch.backends.cuda.matmul.allow_tf32` off
 - `tf32` — fp32 activations and `allow_tf32` on
-- `bf16` — bf16 activations (tiles downcast for the GEMM, accumulate in fp32)
+- `bf16` — bf16 activations (native Tensor-Core `tl.dot`, accumulate in fp32)
 
-Forward tiles are the measured per-precision table (bf16 `128×64`, fp32 `64×32`). Sequence length is not an autotune key. Inference streams pair bias in Q-row blocks of 1024 so live pair memory is `[H, ROW, N]` rather than `[H, N, N]`. `SampleDiffusion` drops triangle-kernel flags on the token diffusion path so cuEq / Triton-evo cannot steal an eligible launch.
+Forward tiles are the measured per-precision table (bf16 `128×64`, fp32 `64×32`). Sequence length is not an autotune key. Inference pair bias is the 0.125U Linear output. `SampleDiffusion` drops triangle-kernel flags on the token diffusion path so cuEq / Triton-evo cannot steal an eligible launch.
 
 ```bash
 # Default: use Triton when eligible (no S=1 length cutoff)

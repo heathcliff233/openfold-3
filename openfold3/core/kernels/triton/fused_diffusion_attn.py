@@ -56,7 +56,9 @@ _TRUE = {"1", "true", "yes", "on"}
 _MAX_CH = 128
 _MIN_BLOCK_C = 16
 _DEFAULT_MIN_TOKENS = 0
-_PAIR_ROW_BLOCK = 1024
+# Production token lengths are one-shot. Row-streaming clones ``z``
+# slices (``ROW / N`` U) and is slower than the 0.125U Linear output.
+_PAIR_ROW_BLOCK = 4096
 
 
 def is_fused_diffusion_attn_enabled() -> bool:
@@ -201,10 +203,11 @@ if _TRITON_AVAILABLE:
     @triton.jit
     def _dot_f32(a, b, GEMM_MODE: tl.constexpr):
         if GEMM_MODE == "bf16":
+            # Native Tensor-Core MMA. ``input_precision="ieee"`` forces the
+            # slow IEEE path and is why fused bf16 did not scale vs SDPA.
             return tl.dot(
                 a.to(tl.bfloat16),
                 b.to(tl.bfloat16),
-                input_precision="ieee",
                 out_dtype=tl.float32,
             )
         a = a.to(tl.float32)
@@ -1347,6 +1350,21 @@ def _pair_ln_linear_rows(z_rows: torch.Tensor, layer_norm, linear) -> torch.Tens
     return linear(layer_norm(z_rows))
 
 
+def _pair_bias_from_z(
+    z: torch.Tensor,
+    layer_norm,
+    linear,
+    no_heads: int,
+) -> torch.Tensor:
+    """``LN_z → Linear_z`` as ``[B, 1, H, N_Q, N_K]`` without copying ``z``."""
+    bsz, n_q, n_k, c_z = z.shape
+    z_2d = z.reshape(bsz * n_q * n_k, c_z)
+    if not z_2d.is_contiguous():
+        z_2d = z_2d.contiguous()
+    pb = _pair_ln_linear_rows(z_2d, layer_norm, linear)
+    return pb.view(bsz, n_q, n_k, no_heads).permute(0, 3, 1, 2).unsqueeze(1)
+
+
 def can_use_fused_diffusion_mha(
     a: torch.Tensor,
     z: torch.Tensor,
@@ -1387,7 +1405,8 @@ def _project_heads(
     c_hidden: int,
 ) -> torch.Tensor:
     y = linear(x)
-    return y.view(*y.shape[:-1], no_heads, c_hidden).permute(0, 1, 3, 2, 4).contiguous()
+    # Flash is length-generic in the ``N`` stride; do not clone Q/K/V.
+    return y.view(*y.shape[:-1], no_heads, c_hidden).permute(0, 1, 3, 2, 4)
 
 
 def fused_diffusion_mha_from_module(
@@ -1407,10 +1426,11 @@ def fused_diffusion_mha_from_module(
     inf: float,
     cached_pair_bias_h: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Inference MHA: stream pair bias in Q-row blocks, flash, gate, ``W_o``.
+    """Inference MHA: pair ``LN → Linear``, flash, gate, ``W_o``.
 
-    ``a`` is post-AdaLN. Does not materialize ``[H, N, N]`` pair bias unless a
-    cache is supplied. Callers must check ``can_use_fused_diffusion_mha``.
+    ``a`` is post-AdaLN. Pair bias is the 0.125U Linear output from a
+    packed view of ``z``. A Q-row loop remains only when
+    ``_PAIR_ROW_BLOCK`` is patched below ``N`` (tests).
     """
     bsz, samples, n_tok, c_a = a.shape
     scale = 1.0 / math.sqrt(c_hidden)
@@ -1421,7 +1441,6 @@ def fused_diffusion_mha_from_module(
 
     k = _project_heads(a, linear_k, no_heads, c_hidden)
     v = _project_heads(a, linear_v, no_heads, c_hidden)
-    out = a.new_empty(bsz, samples, n_tok, c_a)
 
     def _finish(attn_heads: torch.Tensor, a_rows: torch.Tensor) -> torch.Tensor:
         o = attn_heads.transpose(-2, -3)
@@ -1433,16 +1452,19 @@ def fused_diffusion_mha_from_module(
     if cached_pair_bias_h is not None:
         pair = cached_pair_bias_h.unsqueeze(1)
         q = _project_heads(a, linear_q, no_heads, c_hidden)
-        attn = fused_diffusion_attn(q, k, v, mask_bias, pair, scale)
-        return _finish(attn, a)
+        return _finish(fused_diffusion_attn(q, k, v, mask_bias, pair, scale), a)
 
     row = _pair_row_block(n_tok)
+    if row >= n_tok:
+        q = _project_heads(a, linear_q, no_heads, c_hidden)
+        pair = _pair_bias_from_z(z, layer_norm_z, linear_z, no_heads)
+        return _finish(fused_diffusion_attn(q, k, v, mask_bias, pair, scale), a)
+
+    out = a.new_empty(bsz, samples, n_tok, c_a)
     for i0 in range(0, n_tok, row):
         i1 = min(n_tok, i0 + row)
-        z_rows = z[:, i0:i1].contiguous()
-        pb = _pair_ln_linear_rows(z_rows, layer_norm_z, linear_z)
-        pb = pb.permute(0, 3, 1, 2).unsqueeze(1).contiguous()
+        pair = _pair_bias_from_z(z[:, i0:i1], layer_norm_z, linear_z, no_heads)
         q = _project_heads(a[:, :, i0:i1], linear_q, no_heads, c_hidden)
-        attn = fused_diffusion_attn(q, k, v, mask_bias, pb, scale)
+        attn = fused_diffusion_attn(q, k, v, mask_bias, pair, scale)
         out[:, :, i0:i1] = _finish(attn, a[:, :, i0:i1])
     return out
