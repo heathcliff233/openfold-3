@@ -31,6 +31,33 @@ from openfold3.core.utils.atom_attention_block_utils import convert_single_rep_t
 from openfold3.core.utils.tensor_utils import permute_final_dims
 
 
+def _pair_ln_linear(z: torch.Tensor, layer_norm, linear) -> torch.Tensor:
+    from openfold3.core.kernels.triton.fused_ln_linear import (
+        fused_ln_linear,
+        is_fused_ln_linear_eligible,
+    )
+
+    gamma = layer_norm.weight
+    if gamma is not None and is_fused_ln_linear_eligible(
+        z, gamma, layer_norm.bias, linear.weight, linear.bias
+    ):
+        return fused_ln_linear(
+            z, gamma, layer_norm.bias, linear.weight, linear.bias, layer_norm.eps
+        )
+    return linear(layer_norm(z))
+
+
+def _unsqueeze_bias_sample(bias: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+    """Insert a broadcast sample dim so ``[B, H, N, N]`` becomes ``[B, 1, H, N, N]``."""
+    n_extra = a.dim() - bias.dim() + 1
+    if n_extra <= 0:
+        return bias
+    head_pos = bias.dim() - 3
+    return bias.view(
+        bias.shape[:head_pos] + (1,) * n_extra + bias.shape[head_pos:]
+    )
+
+
 class AttentionPairBias(nn.Module):
     """Attention layer with pair bias.
 
@@ -119,11 +146,18 @@ class AttentionPairBias(nn.Module):
 
         self.sigmoid = nn.Sigmoid()
 
+    def prep_static_pair_bias(self, z: torch.Tensor) -> torch.Tensor:
+        """``LN_z(z) @ W_z`` as ``[*, H, N, N]`` for the optional rollout cache."""
+        return permute_final_dims(
+            _pair_ln_linear(z, self.layer_norm_z, self.linear_z), [2, 0, 1]
+        )
+
     def _prep_bias(
         self,
         a: torch.Tensor,
         z: torch.Tensor,
         mask: torch.Tensor | None,
+        cached_pair_bias_h: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         """
         Args:
@@ -133,6 +167,8 @@ class AttentionPairBias(nn.Module):
                 [*, N, N, C_z] Pair embedding
             mask:
                 [*, N] Mask for token or atom-level embedding
+            cached_pair_bias_h:
+                Optional precomputed ``[*, H, N, N]`` pair bias
 
         Returns:
             List of bias terms. Includes the pair bias and attention mask.
@@ -152,15 +188,16 @@ class AttentionPairBias(nn.Module):
         mask_bias = (self.inf * (mask - 1))[..., None, None, :]
         biases = [mask_bias]
 
-        # [*, N, N, C_z]
-        z = self.layer_norm_z(z)
+        if cached_pair_bias_h is None:
+            z = permute_final_dims(
+                _pair_ln_linear(z, self.layer_norm_z, self.linear_z), [2, 0, 1]
+            )
+        else:
+            z = cached_pair_bias_h
 
-        # [*, N, N, no_heads]
-        z = self.linear_z(z)
-
-        # [*, no_heads, N, N]
-        z = permute_final_dims(z, [2, 0, 1])
-
+        # Token diffusion is ``[B, S, N, C]`` vs pair ``[B, N, N, C_z]``.
+        # The fused kernel and its eligibility both require 5D pair bias.
+        z = _unsqueeze_bias_sample(z, a)
         biases.append(z)
 
         return biases
@@ -176,6 +213,7 @@ class AttentionPairBias(nn.Module):
         use_triton_triangle_kernels: bool = False,
         use_lma: bool = False,
         use_high_precision_attention: bool = False,
+        cached_pair_bias_h: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -201,7 +239,45 @@ class AttentionPairBias(nn.Module):
         """
         a = self.layer_norm_a(a, s) if self.use_ada_layer_norm else self.layer_norm_a(a)
 
-        biases = self._prep_bias(a=a, z=z, mask=mask)
+        use_alt = (
+            use_deepspeed_evo_attention
+            or use_cueq_triangle_kernels
+            or use_triton_triangle_kernels
+            or use_lma
+            or use_high_precision_attention
+        )
+        if not use_alt and not torch.is_grad_enabled():
+            from openfold3.core.kernels.triton.fused_diffusion_attn import (
+                can_use_fused_diffusion_mha,
+                fused_diffusion_mha_from_module,
+            )
+
+            if can_use_fused_diffusion_mha(
+                a, z, self.mha.no_heads, cached_pair_bias_h=cached_pair_bias_h
+            ):
+                a = fused_diffusion_mha_from_module(
+                    a,
+                    z,
+                    mask,
+                    linear_q=self.mha.linear_q,
+                    linear_k=self.mha.linear_k,
+                    linear_v=self.mha.linear_v,
+                    linear_g=self.mha.linear_g,
+                    linear_o=self.mha.linear_o,
+                    layer_norm_z=self.layer_norm_z,
+                    linear_z=self.linear_z,
+                    no_heads=self.mha.no_heads,
+                    c_hidden=self.mha.c_hidden,
+                    inf=self.inf,
+                    cached_pair_bias_h=cached_pair_bias_h,
+                )
+                if self.use_ada_layer_norm:
+                    a = self.sigmoid(self.linear_ada_out(s)) * a
+                return a
+
+        biases = self._prep_bias(
+            a=a, z=z, mask=mask, cached_pair_bias_h=cached_pair_bias_h
+        )
 
         # TODO: Make this less awkward, DS kernel has strict shape asserts
         #  and expects batch and seq dims to exist

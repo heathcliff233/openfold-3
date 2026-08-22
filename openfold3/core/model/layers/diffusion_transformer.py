@@ -129,6 +129,7 @@ class DiffusionTransformerBlock(nn.Module):
         use_lma: bool = False,
         use_high_precision_attention: bool = False,
         _mask_trans: bool = True,
+        cached_pair_bias_h: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -150,6 +151,8 @@ class DiffusionTransformerBlock(nn.Module):
                 Whether to run attention in high precision
             _mask_trans:
                 Whether to mask the output of the transition layer
+            cached_pair_bias_h:
+                Optional precomputed ``[*, H, N, N]`` pair bias for this block
         """
         # Note: Differs from SI, residual connection added.
 
@@ -164,6 +167,7 @@ class DiffusionTransformerBlock(nn.Module):
                 use_triton_triangle_kernels=use_triton_triangle_kernels,
                 use_lma=use_lma,
                 use_high_precision_attention=use_high_precision_attention,
+                cached_pair_bias_h=cached_pair_bias_h,
             )
         else:
             a = a + self.attention_pair_bias(
@@ -272,6 +276,12 @@ class DiffusionTransformer(nn.Module):
             ]
         )
 
+    def prepare_pair_bias_cache(self, z: torch.Tensor) -> list[torch.Tensor] | None:
+        """Per-block ``LN_z @ W_z`` as ``[*, H, N, N]``. ``None`` on the atom path."""
+        if self.use_cross_attention:
+            return None
+        return [block.attention_pair_bias.prep_static_pair_bias(z) for block in self.blocks]
+
     def forward(
         self,
         a: torch.Tensor,
@@ -284,6 +294,7 @@ class DiffusionTransformer(nn.Module):
         use_lma: bool = False,
         use_high_precision_attention: bool = False,
         _mask_trans: bool = True,
+        pair_bias_cache: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -307,6 +318,8 @@ class DiffusionTransformer(nn.Module):
                 Whether to run attention in high precision
             _mask_trans:
                 Whether to mask the output of the transition layer
+            pair_bias_cache:
+                Optional per-block ``[*, H, N, N]`` pair biases
         """
         # Single layer norm for atom attention enc/dec diffusion transformer
         if self.use_cross_attention:
@@ -324,8 +337,11 @@ class DiffusionTransformer(nn.Module):
                 use_lma=use_lma,
                 use_high_precision_attention=use_high_precision_attention,
                 _mask_trans=_mask_trans,
+                cached_pair_bias_h=(
+                    pair_bias_cache[i] if pair_bias_cache is not None else None
+                ),
             )
-            for b in self.blocks
+            for i, b in enumerate(self.blocks)
         ]
 
         blocks_per_ckpt = self.blocks_per_ckpt

@@ -179,3 +179,37 @@ OPENFOLD3_FUSED_TRI_ATTN_V1=1
 # Force eager / cuEq / AMD Triton-evo / chunked inference triangle attention
 OPENFOLD3_FUSED_TRI_ATTN_V1=0
 ```
+
+# Fused diffusion attention
+
+Token-level `AttentionPairBias` in `DiffusionTransformer` (AdaLN, self-attention, `c_a=768`, `c_hidden=48`, `H=16`) can run as a length-generic Triton flash kernel instead of materializing `[B, S, H, N, N]` scores. Inference streams `LN_z → Linear_z` in Q-row blocks so the live pair-bias tile is `[H, ROW, N]` rather than `[H, N, N]`, projects Q per row, and fuses gate / `W_o` on that slice. AdaLN and ada-out stay on the eager module. `N_Q` / `N_K` / `S` / strides are not specialize keys. One program owns a `(b, s, h)` Q-tile.
+
+Under training, an autograd wrapper saves `LSE` and rematerializes scores. `dQ` loops `S` in one exclusive `(b, h)` program so `dBias` accumulates into `[B, S_pb, H, N_Q, N_K]` — no `[B, S, H, N, N]` scratch and no atomics. Pair-bias `LN_z → Linear_z` uses the Phase 3a `fused_ln_linear` dispatcher when eligible.
+
+There is no production length cutoff: `S=1` and `S>1` both use the fused path when the other guards match. `OPENFOLD3_FUSED_DIFFUSION_ATTN_MIN_TOKENS` remains as an optional override (default 0). Cross-attention (atom enc/dec) is not this kernel.
+
+The optional pair-bias cache stores one `[*, H, N, N]` per token block (`N² × blocks × heads`, 3U at production `H=16`, 24 blocks) and reuses it across the 200-step rollout (`zij` does not depend on `t`). It is **off** by default; speed claims with the cache on must also report the resident U.
+
+## Triton kernel
+
+On CUDA with `[B, S, N, C]` query data, self-attention, two biases, `float32` or `bfloat16` activations, and `c_hidden ≤ 128`, the fused path uses one `GEMM_MODE` for every `tl.dot`:
+
+- `ieee` — fp32 activations and `torch.backends.cuda.matmul.allow_tf32` off
+- `tf32` — fp32 activations and `allow_tf32` on
+- `bf16` — bf16 activations (tiles downcast for the GEMM, accumulate in fp32)
+
+Forward tiles are the measured per-precision table (bf16 `128×64`, fp32 `64×32`). Sequence length is not an autotune key. Inference streams pair bias in Q-row blocks of 1024 so live pair memory is `[H, ROW, N]` rather than `[H, N, N]`. `SampleDiffusion` drops triangle-kernel flags on the token diffusion path so cuEq / Triton-evo cannot steal an eligible launch.
+
+```bash
+# Default: use Triton when eligible (no S=1 length cutoff)
+OPENFOLD3_FUSED_DIFFUSION_ATTN=1
+
+# Optional override; default 0 (always on when eligible)
+OPENFOLD3_FUSED_DIFFUSION_ATTN_MIN_TOKENS=0
+
+# Force the eager einsum + softmax scores path
+OPENFOLD3_FUSED_DIFFUSION_ATTN=0
+
+# Optional rollout pair-bias cache (off; +3U at production token shapes)
+OPENFOLD3_DIFFUSION_PAIR_BIAS_CACHE=0
+```

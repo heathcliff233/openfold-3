@@ -413,7 +413,23 @@ class Attention(nn.Module):
         if biases is None:
             biases = []
 
-        # DeepSpeed, cuequivariance, and Triton kernels apply scaling internally
+        from openfold3.core.kernels.triton.fused_diffusion_attn import (
+            can_use_fused_diffusion_attention,
+            fused_diffusion_attn,
+        )
+
+        use_fused_diffusion = can_use_fused_diffusion_attention(
+            q_x, kv_x, biases, self.no_heads
+        ) and not (
+            use_deepspeed_evo_attention
+            or use_cueq_triangle_kernels
+            or use_triton_triangle_kernels
+            or use_lma
+            or use_high_precision
+        )
+
+        # DeepSpeed, cuequivariance, Triton evo, and fused diffusion apply
+        # scaling internally
         q, k, v = self._prep_qkv(
             q_x,
             kv_x,
@@ -421,11 +437,16 @@ class Attention(nn.Module):
                 use_deepspeed_evo_attention
                 or use_cueq_triangle_kernels
                 or use_triton_triangle_kernels
+                or use_fused_diffusion
             ),
         )
 
+        if use_fused_diffusion:
+            scale = 1.0 / math.sqrt(self.c_hidden)
+            o = fused_diffusion_attn(q, k, v, biases[0], biases[1], scale)
+            o = o.transpose(-2, -3)
         # cuequivariance kernel takes precedence over use_deepspeed_evo_attention
-        if use_cueq_triangle_kernels:
+        elif use_cueq_triangle_kernels:
             if not cueq_is_installed:
                 raise ValueError(
                     "Running with `use_cueq_triangle_kernels` but package is not "

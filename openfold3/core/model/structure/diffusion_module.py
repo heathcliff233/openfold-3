@@ -141,6 +141,7 @@ class DiffusionModule(nn.Module):
         use_lma: bool = False,
         use_high_precision_attention: bool = False,
         _mask_trans: bool = True,
+        pair_bias_cache: list | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -176,6 +177,8 @@ class DiffusionModule(nn.Module):
                 Whether to run attention in high precision
             _mask_trans:
                 Whether to mask the output of the transition layer
+            pair_bias_cache:
+                Optional per-block token pair biases reused across rollout steps
         Returns:
             [*, N_atom, 3] Denoised atom positions
         """
@@ -216,6 +219,7 @@ class DiffusionModule(nn.Module):
             use_lma=use_lma,
             use_high_precision_attention=use_high_precision_attention,
             _mask_trans=_mask_trans,
+            pair_bias_cache=pair_bias_cache,
         )
 
         ai = self.layer_norm_a(ai)
@@ -325,8 +329,42 @@ class SampleDiffusion(nn.Module):
         Returns:
             [*, N_atom, 3] Sampled atom positions
         """
+        from openfold3.core.kernels.triton.fused_diffusion_attn import (
+            is_diffusion_pair_bias_cache_enabled,
+            is_fused_diffusion_attn_enabled,
+        )
+
+        if is_fused_diffusion_attn_enabled():
+            # Token diffusion attn is not triangle attention; leave the
+            # flags on and they steal the fused path (cuEq accepts bf16
+            # c_hidden=48). Trunk / template triangle flags stay elsewhere.
+            use_cueq_triangle_kernels = False
+            use_triton_triangle_kernels = False
+
         atom_mask = batch["atom_mask"]
         batch_dim, num_atoms = atom_mask.shape[0], atom_mask.shape[-1]
+
+        pair_bias_cache = None
+        if is_diffusion_pair_bias_cache_enabled() and not torch.is_grad_enabled():
+            # zij_conditioned does not depend on t; cache LN_z@W_z across
+            # the 200-step rollout. Resident cost is N² × blocks × heads.
+            _t0 = noise_schedule[0].to(device=atom_mask.device, dtype=atom_mask.dtype)
+            _si0, zij0 = self.diffusion_module.diffusion_conditioning(
+                batch=batch,
+                t=_t0,
+                si_input=si_input,
+                si_trunk=si_trunk,
+                zij_trunk=zij_trunk,
+                use_conditioning=use_conditioning,
+                chunk_size=chunk_size,
+            )
+            del _si0
+            pair_bias_cache = (
+                self.diffusion_module.diffusion_transformer.prepare_pair_bias_cache(
+                    zij0
+                )
+            )
+            del zij0
 
         xl = noise_schedule[0] * torch.randn(
             (batch_dim, no_rollout_samples, num_atoms, 3),
@@ -366,6 +404,7 @@ class SampleDiffusion(nn.Module):
                 use_lma=use_lma,
                 use_high_precision_attention=use_high_precision_attention,
                 _mask_trans=_mask_trans,
+                pair_bias_cache=pair_bias_cache,
             )
 
             # TODO: Changed from SI, xl_noisy used instead of xl as in EDM paper
