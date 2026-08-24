@@ -270,6 +270,46 @@ def test_module_dispatch_uses_fused(monkeypatch):
     torch.testing.assert_close(y, y_ref, atol=3e-3, rtol=3e-3)
 
 
+def test_high_precision_does_not_block_fused(monkeypatch):
+    import openfold3.core.kernels.triton.fused_diffusion_attn as fda
+
+    calls = []
+    real = fda.fused_diffusion_attn
+
+    def wrapped(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(fda, "fused_diffusion_attn", wrapped)
+    module = (
+        AttentionPairBias(
+            c_q=C_A,
+            c_k=C_A,
+            c_v=C_A,
+            c_s=C_S,
+            c_z=C_Z,
+            c_hidden=CH,
+            no_heads=H,
+            use_ada_layer_norm=True,
+        )
+        .cuda()
+        .train()
+    )
+    a, s, z, mask = _token_inputs()
+    a = a.detach().requires_grad_(True)
+    z = z.detach().requires_grad_(True)
+    module(
+        a, z, s=s, mask=mask, use_high_precision_attention=True
+    ).square().mean().backward()
+    assert calls, "fused diffusion attn must run under the training high-precision flag"
+
+    calls.clear()
+    module.eval()
+    with torch.inference_mode():
+        module(a.detach(), z.detach(), s=s, mask=mask, use_high_precision_attention=True)
+    assert calls, "fused diffusion attn must run under inference high-precision flag"
+
+
 def test_pair_bias_cache_bitwise(monkeypatch):
     _set_tf32(False)
     monkeypatch.setenv("OPENFOLD3_FUSED_DIFFUSION_ATTN", "0")

@@ -28,10 +28,10 @@ into ``[B, S_pb, H, N_Q, N_K]`` (``S_pb`` is 1 when pair bias is shared)
 by looping ``S`` in the exclusive ``dQ`` program — no ``[B, S, H, N, N]``
 scratch and no atomics.
 
-The module path streams ``LN_z → Linear_z`` in Q-row blocks so the live
-pair-bias tile is ``[H, ROW, N]`` rather than ``[H, N, N]``. AdaLN and
-ada-out stay on the eager module. Ineligible shapes use the
-matching-precision eager einsum.
+The module path projects pair bias with ``LN_z → Linear_z`` from a
+packed view of ``z`` (no row clone). The live pair is ``[H, N, N]`` =
+0.125U. Q/K/V keep native strides. AdaLN and ada-out stay on the eager
+module. Ineligible shapes use the matching-precision eager einsum.
 """
 
 from __future__ import annotations
@@ -1372,7 +1372,7 @@ def can_use_fused_diffusion_mha(
     *,
     cached_pair_bias_h: torch.Tensor | None = None,
 ) -> bool:
-    """Eligibility for the module-level row-blocked path (post-AdaLN ``a``)."""
+    """Eligibility for the module-level fused MHA path (post-AdaLN ``a``)."""
     if (
         not is_fused_diffusion_attn_enabled()
         or not _TRITON_AVAILABLE

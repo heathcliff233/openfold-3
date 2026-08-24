@@ -244,7 +244,6 @@ class AttentionPairBias(nn.Module):
             or use_cueq_triangle_kernels
             or use_triton_triangle_kernels
             or use_lma
-            or use_high_precision_attention
         )
         if not use_alt and not torch.is_grad_enabled():
             from openfold3.core.kernels.triton.fused_diffusion_attn import (

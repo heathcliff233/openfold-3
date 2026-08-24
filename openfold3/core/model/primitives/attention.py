@@ -425,7 +425,6 @@ class Attention(nn.Module):
             or use_cueq_triangle_kernels
             or use_triton_triangle_kernels
             or use_lma
-            or use_high_precision
         )
 
         # DeepSpeed, cuequivariance, Triton evo, and fused diffusion apply

@@ -179,7 +179,13 @@ def _bench_train(args) -> None:
                 def run(flag):
                     os.environ["OPENFOLD3_FUSED_DIFFUSION_ATTN"] = flag
                     a, z = a0.detach().requires_grad_(True), z0.detach().requires_grad_(True)
-                    module(a, z, s=s0, mask=mask).backward(go)
+                    module(
+                        a,
+                        z,
+                        s=s0,
+                        mask=mask,
+                        use_high_precision_attention=True,
+                    ).backward(go)
                     module.zero_grad(set_to_none=True)
 
                 def eager():
