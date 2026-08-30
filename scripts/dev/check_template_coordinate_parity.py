@@ -51,8 +51,7 @@ REPO = Path(__file__).resolve().parents[2]
 DEFAULT_RUNNER = REPO / "data/inference_benchmark_msa_template/runner.yml"
 KNOWN_QUERIES = {
     "7cnx": REPO / "data/inference_benchmark_msa_template/queries/7cnx.json",
-    "ubiquitin": REPO
-    / "data/inference_benchmark_msa_template/queries/ubiquitin.json",
+    "ubiquitin": REPO / "data/inference_benchmark_msa_template/queries/ubiquitin.json",
     "mcl1": REPO / "data/inference_benchmark_msa_template/queries/mcl1.json",
 }
 
@@ -161,8 +160,7 @@ def legacy_batch_from_coordinates(coord_batch: dict) -> dict:
     legacy = {
         key: (value.clone() if torch.is_tensor(value) else value)
         for key, value in coord_batch.items()
-        if key
-        not in ("template_pseudo_beta_coords", "template_frame_atom_coords")
+        if key not in ("template_pseudo_beta_coords", "template_frame_atom_coords")
     }
     legacy["template_distogram"] = create_template_distogram(
         pseudo_beta, pb_mask, multichain
@@ -284,9 +282,7 @@ def main() -> None:
             failures.append(f"{key}: missing")
             continue
         if info["max_abs"] > limit:
-            failures.append(
-                f"{key}: max_abs={info['max_abs']:.6g} > atol={limit:g}"
-            )
+            failures.append(f"{key}: max_abs={info['max_abs']:.6g} > atol={limit:g}")
 
     payload = {
         "query": str(query_json),

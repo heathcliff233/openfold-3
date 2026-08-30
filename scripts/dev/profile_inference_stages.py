@@ -117,9 +117,7 @@ class FastStageProfiler:
         self._patches.clear()
 
 
-def install_hooks(
-    model, prof: FastStageProfiler, track_trunk_substages: bool
-) -> None:
+def install_hooks(model, prof: FastStageProfiler, track_trunk_substages: bool) -> None:
     prof.wrap(model, "run_trunk", "TRUNK", track_mem=not track_trunk_substages)
     prof.wrap(model.sample_diffusion, "forward", "DIFFUSION", track_mem=True)
     prof.wrap(model.aux_heads, "forward", "CONFIDENCE", track_mem=True)
@@ -284,9 +282,7 @@ def profile(args) -> dict:
     print("Hooked stage forward...")
     batch = get_batch(runner, device)
     profiler = FastStageProfiler()
-    install_hooks(
-        model, profiler, track_trunk_substages=args.track_trunk_substages
-    )
+    install_hooks(model, profiler, track_trunk_substages=args.track_trunk_substages)
     try:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -337,8 +333,7 @@ def print_report(result: dict) -> None:
         f"samples={result['n_diffusion_samples']} 1U={_mib(u_bytes):.1f} MiB"
     )
     print(
-        f"model_params+buffers={_gib(params):.2f} GiB  "
-        f"total_peak={_gib(peak):.2f} GiB"
+        f"model_params+buffers={_gib(params):.2f} GiB  total_peak={_gib(peak):.2f} GiB"
     )
     print(f"peak_above_params={_gib(above):.2f} GiB = {above / u_bytes:.2f}U")
     print(

@@ -22,6 +22,7 @@ sequence lengths, reporting correctness, peak memory, and wall time.
 from __future__ import annotations
 
 import time
+from functools import partial
 
 from openfold3.entry_points.import_utils import _torch_gpu_setup
 
@@ -89,9 +90,7 @@ def bench_one(N: int) -> dict:
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
     z_tmp = z.clone()
-    fused_relpos_embed_add_(
-        z_tmp, w, idx1, idx2, idx3, same_entity, SAME_ENTITY_OFFSET
-    )
+    fused_relpos_embed_add_(z_tmp, w, idx1, idx2, idx3, same_entity, SAME_ENTITY_OFFSET)
     torch.cuda.synchronize()
     fused_peak_U = (torch.cuda.max_memory_allocated() - base) / U_bytes
     del z_tmp
@@ -184,11 +183,25 @@ def bench_bwd_one(N: int) -> dict:
         torch.cuda.synchronize()
         return (time.perf_counter() - t0) / REPS * 1000
 
-    eager_fn = lambda: eager_relpos_weight_grad(
-        grad_z, idx1, idx2, idx3, same_entity, SAME_ENTITY_OFFSET, VOCAB
+    eager_fn = partial(
+        eager_relpos_weight_grad,
+        grad_z,
+        idx1,
+        idx2,
+        idx3,
+        same_entity,
+        SAME_ENTITY_OFFSET,
+        VOCAB,
     )
-    fused_fn = lambda: fused_relpos_weight_grad(
-        grad_z, idx1, idx2, idx3, same_entity, SAME_ENTITY_OFFSET, VOCAB
+    fused_fn = partial(
+        fused_relpos_weight_grad,
+        grad_z,
+        idx1,
+        idx2,
+        idx3,
+        same_entity,
+        SAME_ENTITY_OFFSET,
+        VOCAB,
     )
 
     eager_peak_U = None

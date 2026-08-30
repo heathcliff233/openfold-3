@@ -213,9 +213,22 @@ class DiffusionConditioning(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         pair_token_mask = token_mask.unsqueeze(-1) * token_mask.unsqueeze(-2)
 
-        # Pair conditioning
+        # Pair conditioning. Inference fused path writes zij += update in
+        # place (same kernel as PairBlock). Training keeps the out-of-place add.
+        # Do not in-place into zij_trunk: _embed_zij returns a new tensor.
+        from openfold3.core.kernels.triton.fused_swiglu_transition import (
+            is_fused_swiglu_transition_enabled,
+        )
+
         for l in self.transition_z:
-            zij = zij + l(zij, mask=pair_token_mask, chunk_size=chunk_size)
+            if (
+                is_fused_swiglu_transition_enabled()
+                and not torch.is_grad_enabled()
+                and isinstance(l, SwiGLUTransition)
+            ):
+                zij = l._transition_inplace(x=zij, mask=pair_token_mask, residual=zij)
+            else:
+                zij = zij + l(zij, mask=pair_token_mask, chunk_size=chunk_size)
 
         # Single conditioning
         for l in self.transition_s:
@@ -235,12 +248,8 @@ class DiffusionConditioning(nn.Module):
         if self.chunk_size_tuner is not None:
             chunk_size = self.chunk_size_tuner.tune_chunk_size(
                 representative_fn=self._forward,
-                # We don't want to write in-place during chunk tuning runs
-                args=(
-                    si.clone(),
-                    zij.clone(),
-                    token_mask,
-                ),
+                # Probe must not write in-place; tuner clones on a cache miss.
+                args=(si, zij, token_mask),
                 max_chunk_size=chunk_size,
             )
 

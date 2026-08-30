@@ -13,10 +13,17 @@
 # limitations under the License.
 
 import unittest
+from unittest.mock import patch
 
+import pytest
 import torch
 
+import openfold3.tests.utils.compare_utils as compare_utils
+from openfold3.core.kernels.triton.fused_swiglu_transition import (
+    is_fused_swiglu_transition_eligible,
+)
 from openfold3.core.model.layers.diffusion_conditioning import DiffusionConditioning
+from openfold3.core.model.layers.transition import SwiGLUTransition
 from openfold3.core.utils.relpos import relpos_complex
 from openfold3.projects.of3_all_atom.project_entry import OF3ProjectEntry
 from openfold3.tests.config import consts
@@ -213,6 +220,78 @@ class TestDiffusionConditioning(unittest.TestCase):
 
         self.assertTrue(si.shape == (batch_size, 1, n_token, c_s))
         self.assertTrue(zij.shape == (batch_size, 1, n_token, n_token, c_z))
+
+
+def _cuda_conditioning_module(n_token: int = 64):
+    proj_entry = OF3ProjectEntry()
+    config = proj_entry.get_model_config_with_presets()
+    c_s_input = consts.c_s + 65
+    diff_cond_config = config.architecture.diffusion_module.diffusion_conditioning
+    diff_cond_config.update(
+        {"c_s": consts.c_s, "c_s_input": c_s_input, "c_z": consts.c_z}
+    )
+    return DiffusionConditioning(**diff_cond_config).cuda().eval()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@compare_utils.skip_unless_cuda_available()
+@compare_utils.skip_unless_triton_installed()
+def test_inference_pair_swiglu_inplace_matches_eager_add(dtype, monkeypatch):
+    monkeypatch.setenv("OPENFOLD3_FUSED_SWIGLU_TRANSITION", "1")
+    n_token = 64
+    dc = _cuda_conditioning_module(n_token)
+    torch.manual_seed(0)
+    si = torch.randn(1, n_token, consts.c_s, device="cuda", dtype=dtype)
+    zij = torch.randn(1, n_token, n_token, consts.c_z, device="cuda", dtype=dtype)
+    token_mask = torch.ones(1, n_token, device="cuda", dtype=dtype)
+    weights = dc.transition_z[0]._fused_weight_args()
+    if not is_fused_swiglu_transition_eligible(zij, *weights):
+        pytest.skip("fused SwiGLU is not eligible for this shape")
+
+    zij_ref = zij.clone()
+    with torch.no_grad():
+        monkeypatch.setenv("OPENFOLD3_FUSED_SWIGLU_TRANSITION", "0")
+        _, zij_eager = dc._forward(si.clone(), zij_ref, token_mask)
+        monkeypatch.setenv("OPENFOLD3_FUSED_SWIGLU_TRANSITION", "1")
+        ptr_before = zij.data_ptr()
+        calls = {"n": 0}
+        real = SwiGLUTransition._transition_inplace
+
+        def _wrapped(self, *args, **kwargs):
+            calls["n"] += 1
+            return real(self, *args, **kwargs)
+
+        with patch.object(SwiGLUTransition, "_transition_inplace", _wrapped):
+            _, zij_fused = dc._forward(si, zij, token_mask)
+    assert calls["n"] == len(dc.transition_z)
+    assert zij_fused.data_ptr() == ptr_before
+    atol = 2e-2 if dtype == torch.bfloat16 else 2e-4
+    torch.testing.assert_close(zij_fused, zij_eager, atol=atol, rtol=atol)
+
+
+@compare_utils.skip_unless_cuda_available()
+@compare_utils.skip_unless_triton_installed()
+def test_training_pair_swiglu_stays_out_of_place(monkeypatch):
+    monkeypatch.setenv("OPENFOLD3_FUSED_SWIGLU_TRANSITION", "1")
+    n_token = 64
+    dc = _cuda_conditioning_module(n_token)
+    torch.manual_seed(0)
+    si = torch.randn(1, n_token, consts.c_s, device="cuda", requires_grad=True)
+    zij = torch.randn(
+        1, n_token, n_token, consts.c_z, device="cuda", requires_grad=True
+    )
+    token_mask = torch.ones(1, n_token, device="cuda")
+    ptr_before = zij.data_ptr()
+    with patch.object(
+        SwiGLUTransition,
+        "_transition_inplace",
+        wraps=SwiGLUTransition._transition_inplace,
+    ) as inplace:
+        _, zij_out = dc._forward(si, zij, token_mask)
+        zij_out.square().mean().backward()
+    assert inplace.call_count == 0
+    assert zij_out.data_ptr() != ptr_before
+    assert zij.grad is not None
 
 
 if __name__ == "__main__":

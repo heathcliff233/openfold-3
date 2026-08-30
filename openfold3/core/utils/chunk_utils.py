@@ -68,7 +68,7 @@ def use_chunked_trimul(inplace_safe: bool) -> bool:
 
 
 def transition_chunk_cap() -> int | None:
-    """Optional cap for transition/OPM chunk size (``OPENFOLD3_TRANSITION_CHUNK_CAP``)."""
+    """Optional cap for transition/OPM (``OPENFOLD3_TRANSITION_CHUNK_CAP``)."""
     return _positive_env_int("OPENFOLD3_TRANSITION_CHUNK_CAP")
 
 
@@ -453,6 +453,11 @@ class ChunkSizeTuner:
 
         return consistent
 
+    @staticmethod
+    def _clone_arg_tree(args: Any) -> Any:
+        """Deep-clone tensor leaves so a probe cannot in-place-write live args."""
+        return tree_map(lambda t: t.clone(), args, torch.Tensor)
+
     def tune_chunk_size(
         self,
         representative_fn: Callable,
@@ -462,6 +467,8 @@ class ChunkSizeTuner:
         def remove_tensors(a):
             return (a.shape, a.dtype.itemsize) if type(a) is torch.Tensor else a
 
+        # Cache key is (shape, dtype.itemsize) + max_chunk_size. Look up
+        # before cloning: a hit never needs a pair-sized copy.
         arg_data = tree_map(remove_tensors, args, object)
         for cached_arg_data, cached_max, cached_size in self.cached_chunk_sizes:
             if cached_max == max_chunk_size and self._compare_arg_caches(
@@ -469,9 +476,11 @@ class ChunkSizeTuner:
             ):
                 return cached_size
 
+        # Miss: clone tensor leaves, then trial-run. Probe must not write
+        # in-place into the caller's activations.
         chunk_size = self._determine_favorable_chunk_size(
             fn=representative_fn,
-            args=args,
+            args=self._clone_arg_tree(args),
             max_chunk_size=max_chunk_size,
         )
         self.cached_chunk_sizes.append((arg_data, max_chunk_size, chunk_size))

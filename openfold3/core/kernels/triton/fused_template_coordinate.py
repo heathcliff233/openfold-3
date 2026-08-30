@@ -134,15 +134,15 @@ if _TRITON_AVAILABLE:
 
         frame_i_base = frame_coords_ptr + i * stride_frame_i
         n_x = tl.load(frame_i_base, mask=pair_mask, other=0.0).to(tl.float32)
-        n_y = tl.load(
-            frame_i_base + stride_frame_xyz, mask=pair_mask, other=0.0
-        ).to(tl.float32)
+        n_y = tl.load(frame_i_base + stride_frame_xyz, mask=pair_mask, other=0.0).to(
+            tl.float32
+        )
         n_z = tl.load(
             frame_i_base + 2 * stride_frame_xyz, mask=pair_mask, other=0.0
         ).to(tl.float32)
-        ca_x = tl.load(
-            frame_i_base + stride_frame_atom, mask=pair_mask, other=0.0
-        ).to(tl.float32)
+        ca_x = tl.load(frame_i_base + stride_frame_atom, mask=pair_mask, other=0.0).to(
+            tl.float32
+        )
         ca_y = tl.load(
             frame_i_base + stride_frame_atom + stride_frame_xyz,
             mask=pair_mask,
@@ -168,9 +168,9 @@ if _TRITON_AVAILABLE:
         ).to(tl.float32)
         frame_j_base = frame_coords_ptr + j * stride_frame_i + stride_frame_atom
         j_ca_x = tl.load(frame_j_base, mask=pair_mask, other=0.0).to(tl.float32)
-        j_ca_y = tl.load(
-            frame_j_base + stride_frame_xyz, mask=pair_mask, other=0.0
-        ).to(tl.float32)
+        j_ca_y = tl.load(frame_j_base + stride_frame_xyz, mask=pair_mask, other=0.0).to(
+            tl.float32
+        )
         j_ca_z = tl.load(
             frame_j_base + 2 * stride_frame_xyz, mask=pair_mask, other=0.0
         ).to(tl.float32)
@@ -456,13 +456,13 @@ if _TRITON_AVAILABLE:
         if not COMPUTE_SCALAR:
             feature_mask &= feature < 39
 
-        accumulator = tl.zeros(
-            (BLOCK_CHANNELS, BLOCK_FEATURES), dtype=tl.float32
-        )
+        accumulator = tl.zeros((BLOCK_CHANNELS, BLOCK_FEATURES), dtype=tl.float32)
         pair_count = N * N
         pairs_per_split = (
-            pair_count + SPLIT_K * BLOCK_PAIRS - 1
-        ) // (SPLIT_K * BLOCK_PAIRS) * BLOCK_PAIRS
+            (pair_count + SPLIT_K * BLOCK_PAIRS - 1)
+            // (SPLIT_K * BLOCK_PAIRS)
+            * BLOCK_PAIRS
+        )
         pair_start = split * pairs_per_split
         pair_stop = tl.minimum(pair_start + pairs_per_split, pair_count)
         while pair_start < pair_stop:
@@ -508,14 +508,11 @@ if _TRITON_AVAILABLE:
 
             dgram_scale = pb_pair_mask * in_bin.to(tl.float32)
             features = tl.where(
-                (feature[None, :] < 39)
-                & (feature[None, :] == bin_index[:, None]),
+                (feature[None, :] < 39) & (feature[None, :] == bin_index[:, None]),
                 dgram_scale[:, None],
                 0.0,
             )
-            features += tl.where(
-                feature[None, :] == 39, pb_pair_mask[:, None], 0.0
-            )
+            features += tl.where(feature[None, :] == 39, pb_pair_mask[:, None], 0.0)
             features += tl.where(
                 feature[None, :] == 40,
                 (bb_pair_mask * local_x)[:, None],
@@ -531,9 +528,7 @@ if _TRITON_AVAILABLE:
                 (bb_pair_mask * local_z)[:, None],
                 0.0,
             )
-            features += tl.where(
-                feature[None, :] == 43, bb_pair_mask[:, None], 0.0
-            )
+            features += tl.where(feature[None, :] == 43, bb_pair_mask[:, None], 0.0)
             features = tl.where(
                 pair_mask[:, None] & feature_mask[None, :], features, 0.0
             )
@@ -616,9 +611,7 @@ if _TRITON_AVAILABLE:
         if COMPUTE_DGRAM:
             dgram_mask = output_mask & (feature < 39)
             tl.store(
-                grad_dgram_ptr
-                + channel * stride_dgram_c
-                + feature * stride_dgram_f,
+                grad_dgram_ptr + channel * stride_dgram_c + feature * stride_dgram_f,
                 accumulator,
                 mask=dgram_mask,
             )
@@ -664,9 +657,7 @@ def template_coordinate_projection(
         dgram_weight,
         scalar_weight,
     )
-    if torch.is_grad_enabled() and any(
-        x.requires_grad for x in (source, out, *inputs)
-    ):
+    if torch.is_grad_enabled() and any(x.requires_grad for x in (source, out, *inputs)):
         raise RuntimeError(
             "Raw template coordinate Triton launches are not autograd-aware; "
             "use the model dispatcher"

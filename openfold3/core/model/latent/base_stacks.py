@@ -133,21 +133,14 @@ class MSAStack(nn.Module, ABC):
             )
             tuned_chunk_size = self.chunk_size_tuner.tune_chunk_size(
                 representative_fn=blocks[0],
-                # Tensors cloned to avoid getting written to in-place
-                # A corollary is that chunk size tuning should be disabled for
-                # large N, when z gets really big
-                args=(
-                    m.clone(),
-                    z.clone(),
-                ),
+                # Probe must not write in-place; tuner clones on a cache miss.
+                args=(m, z),
                 max_chunk_size=chunk_size,
             )
             attn_chunk = (
                 tuned_chunk_size if use_flash_kernels else max(1, tuned_chunk_size // 4)
             )
-            attn_chunk = apply_triangle_attn_chunk_cap(
-                attn_chunk, n_tokens=z.shape[-3]
-            )
+            attn_chunk = apply_triangle_attn_chunk_cap(attn_chunk, n_tokens=z.shape[-3])
             tuned_chunk_size = apply_transition_chunk_cap(tuned_chunk_size)
             blocks = [
                 partial(

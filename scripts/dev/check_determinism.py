@@ -28,12 +28,13 @@ import torch  # noqa: E402
 
 from openfold3.core.config import config_utils  # noqa: E402
 from openfold3.core.utils.tensor_utils import tensor_tree_map  # noqa: E402
-from openfold3.entry_points.experiment_runner import InferenceExperimentRunner  # noqa: E402
+from openfold3.entry_points.experiment_runner import (  # noqa: E402
+    InferenceExperimentRunner,
+)
 from openfold3.entry_points.validator import InferenceExperimentConfig  # noqa: E402
 from openfold3.projects.of3_all_atom.config.inference_query_format import (  # noqa: E402
     InferenceQuerySet,
 )
-
 
 FEATURE_KEYS = (
     "ref_pos",
@@ -118,7 +119,9 @@ def apply_patches(state: PatchState) -> None:
     import openfold3.core.model.layers.sequence_local_atom_attention as atom_attention
 
     if not hasattr(inference_mod, "_CHECK_ORIGINAL_GETITEM"):
-        inference_mod._CHECK_ORIGINAL_GETITEM = inference_mod.InferenceDataset.__getitem__
+        inference_mod._CHECK_ORIGINAL_GETITEM = (
+            inference_mod.InferenceDataset.__getitem__
+        )
 
     original_getitem = inference_mod._CHECK_ORIGINAL_GETITEM
 
@@ -336,7 +339,8 @@ def main() -> None:
         textwrap.dedent(
             f"""
             Matrix (production math, seed={args.seed}):
-            - feature repeats: global RNG polluted before each featurization, no pre-seed
+            - feature repeats: global RNG polluted before each featurization,
+              no pre-seed
             - output repeats: same batch, predict_step-style reseed before each forward
 
             configuration                         | features equal | outputs equal

@@ -242,6 +242,40 @@ class TestUtils(unittest.TestCase):
             "Representative function should not have been called again for identical arg shapes and dtypes",
         )
 
+    def test_chunk_size_tuner_cache_hit_does_not_clone(self):
+        tuner = ChunkSizeTuner()
+        live = torch.zeros(2, 3, 4)
+        real_clone = live.clone
+        clone_fn = unittest.mock.Mock(side_effect=lambda: real_clone())
+        live.clone = clone_fn
+
+        def fn(t, chunk_size):
+            return t
+
+        tuner.tune_chunk_size(fn, (live,), max_chunk_size=16)
+        self.assertEqual(clone_fn.call_count, 1)
+        tuner.tune_chunk_size(fn, (live,), max_chunk_size=16)
+        self.assertEqual(
+            clone_fn.call_count,
+            1,
+            "Cache hit must not clone live tensor args",
+        )
+
+    def test_chunk_size_tuner_miss_does_not_mutate_live(self):
+        tuner = ChunkSizeTuner()
+        live = torch.zeros(4, 8)
+        original = live.clone()
+
+        def fn(t, chunk_size):
+            t.add_(1)
+            return t
+
+        tuner.tune_chunk_size(fn, (live,), max_chunk_size=8)
+        self.assertTrue(
+            torch.equal(live, original),
+            "Cache-miss probe must not in-place-write the caller's tensors",
+        )
+
     def test_chunk_size_tuner_does_not_retest_candidates(self):
         # Based on previous bug: the binary search forgot which candidates it
         # had already proven non-viable and re-tested them.
@@ -483,17 +517,11 @@ class TestUtils(unittest.TestCase):
         old = os.environ.get(key)
         try:
             os.environ[key] = "128"
-            self.assertEqual(
-                apply_triangle_attn_chunk_cap(1024, n_tokens=1264), 128
-            )
+            self.assertEqual(apply_triangle_attn_chunk_cap(1024, n_tokens=1264), 128)
             # Cap cannot shrink the working set when N already fits.
-            self.assertEqual(
-                apply_triangle_attn_chunk_cap(1024, n_tokens=76), 1024
-            )
+            self.assertEqual(apply_triangle_attn_chunk_cap(1024, n_tokens=76), 1024)
             os.environ.pop(key, None)
-            self.assertEqual(
-                apply_triangle_attn_chunk_cap(1024, n_tokens=1264), 1024
-            )
+            self.assertEqual(apply_triangle_attn_chunk_cap(1024, n_tokens=1264), 1024)
         finally:
             if old is None:
                 os.environ.pop(key, None)
@@ -511,7 +539,7 @@ class TestUtils(unittest.TestCase):
             os.environ[key] = "128"
             self.assertEqual(trimul_chunk_cap(), 128)
             self.assertTrue(use_chunked_trimul(inplace_safe=True))
-            self.assertFalse(use_chunked_trim(inplace_safe=False))
+            self.assertFalse(use_chunked_trimul(inplace_safe=False))
         finally:
             if old is None:
                 os.environ.pop(key, None)
