@@ -179,11 +179,24 @@ def resolve_paths(args) -> tuple[Path, Path]:
     return query_json, runner_yaml
 
 
+FUSED_ENV_KEYS = (
+    "OPENFOLD3_FUSED_RELPOS",
+    "OPENFOLD3_FUSED_SWIGLU_TRANSITION",
+    "OPENFOLD3_FUSED_LN_LINEAR",
+    "OPENFOLD3_FUSED_TRIMUL",
+    "OPENFOLD3_FUSED_TRI_ATTN_V1",
+    "OPENFOLD3_FUSED_DIFFUSION_ATTN",
+    "OPENFOLD3_FUSED_TEMPLATE_COORD",
+    "OPENFOLD3_DIFFUSION_PAIR_BIAS_CACHE",
+)
+
+
 def build_runner(
     query_json: Path,
     runner_yaml: Path,
     num_samples: int,
     offload_token_cutoff: int,
+    use_cueq: bool,
 ) -> InferenceExperimentRunner:
     runner_args = config_utils.load_yaml(runner_yaml)
     runner_args.setdefault("data_module_args", {})["num_workers"] = 0
@@ -196,7 +209,7 @@ def build_runner(
     memory.offload_inference.token_cutoff = offload_token_cutoff
     memory.use_deepspeed_evo_attention = False
     memory.use_triton_triangle_kernels = False
-    memory.use_cueq_triangle_kernels = True
+    memory.use_cueq_triangle_kernels = bool(use_cueq)
     runner.setup()
     runner.inference_query_set = InferenceQuerySet.from_json(query_json)
     return runner
@@ -233,6 +246,7 @@ def profile(args) -> dict:
         runner_yaml=runner_yaml,
         num_samples=args.samples,
         offload_token_cutoff=args.offload_token_cutoff,
+        use_cueq=args.use_cueq,
     )
     lightning_module = runner.lightning_module.to(device).eval()
     model = lightning_module.model
@@ -316,6 +330,8 @@ def profile(args) -> dict:
         "tri_attn_chunk_cap": os.environ.get("OPENFOLD3_TRI_ATTN_CHUNK_CAP"),
         "trimul_chunk_cap": os.environ.get("OPENFOLD3_TRIMUL_CHUNK_CAP"),
         "transition_chunk_cap": os.environ.get("OPENFOLD3_TRANSITION_CHUNK_CAP"),
+        "use_cueq_triangle_kernels": args.use_cueq,
+        "fused_env": {key: os.environ.get(key) for key in FUSED_ENV_KEYS},
         "stages": profiler.stats,
     }
 
@@ -328,6 +344,10 @@ def print_report(result: dict) -> None:
 
     print()
     print("=" * 100)
+    print(
+        f"use_cueq={result.get('use_cueq_triangle_kernels')}  "
+        f"fused_env={result.get('fused_env')}"
+    )
     print(
         f"n_tok={result['n_tokens']} n_atom={result['n_atoms']} "
         f"samples={result['n_diffusion_samples']} 1U={_mib(u_bytes):.1f} MiB"
@@ -404,7 +424,26 @@ def main() -> None:
         ),
     )
     parser.add_argument("--output-json", type=Path, default=None)
+    parser.add_argument(
+        "--use-cueq",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Triangle cuEquivariance kernels. Default: on if the package is "
+            "installed, else off. The previous hardcoded True crashes when "
+            "cuequivariance is missing."
+        ),
+    )
     args = parser.parse_args()
+
+    from openfold3.core.kernels.cueq_utils import is_cuequivariance_available
+
+    if args.use_cueq is None:
+        args.use_cueq = is_cuequivariance_available()
+    elif args.use_cueq and not is_cuequivariance_available():
+        raise SystemExit(
+            "cuEq requested (--use-cueq) but cuequivariance is not installed"
+        )
 
     if args.triangle_chunk_cap is not None:
         os.environ["OPENFOLD3_TRI_ATTN_CHUNK_CAP"] = str(args.triangle_chunk_cap)

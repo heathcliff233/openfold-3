@@ -280,7 +280,9 @@ class DiffusionTransformer(nn.Module):
         """Per-block ``LN_z @ W_z`` as ``[*, H, N, N]``. ``None`` on the atom path."""
         if self.use_cross_attention:
             return None
-        return [block.attention_pair_bias.prep_static_pair_bias(z) for block in self.blocks]
+        return [
+            block.attention_pair_bias.prep_static_pair_bias(z) for block in self.blocks
+        ]
 
     def forward(
         self,

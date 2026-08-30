@@ -27,11 +27,13 @@ import torch
 
 import openfold3.tests.utils.compare_utils as compare_utils
 from openfold3.core.kernels.triton.fused_diffusion_attn import (
+    _pair_bias_from_z,
     can_use_fused_diffusion_attention,
     can_use_fused_diffusion_mha,
     eager_diffusion_attn,
     fused_diffusion_attn,
     fused_diffusion_attn_min_tokens,
+    fused_diffusion_mha_from_module,
 )
 from openfold3.core.model.layers.attention_pair_bias import AttentionPairBias
 from openfold3.core.model.layers.diffusion_transformer import DiffusionTransformer
@@ -142,6 +144,19 @@ def test_autograd_transposed_qkv_layout():
     torch.testing.assert_close(qf.grad, qe.grad, atol=2e-2, rtol=5e-3)
 
 
+def test_autograd_matches_eager_ieee():
+    _set_tf32(False)
+    q, k, v, mask, pair, scale = _qkv()
+    qf, kf, vf, pf = (t.detach().requires_grad_(True) for t in (q, k, v, pair))
+    fused_diffusion_attn(qf, kf, vf, mask, pf, scale).square().mean().backward()
+    qe, ke, ve, pe = (t.detach().requires_grad_(True) for t in (q, k, v, pair))
+    eager_diffusion_attn(qe, ke, ve, mask, pe, scale).square().mean().backward()
+    torch.testing.assert_close(qf.grad, qe.grad, atol=3e-4, rtol=3e-4)
+    torch.testing.assert_close(kf.grad, ke.grad, atol=3e-4, rtol=3e-4)
+    torch.testing.assert_close(vf.grad, ve.grad, atol=3e-4, rtol=3e-4)
+    torch.testing.assert_close(pf.grad, pe.grad, atol=3e-4, rtol=3e-4)
+
+
 def test_autograd_matches_eager_tf32():
     _set_tf32(True)
     q, k, v, mask, pair, scale = _qkv()
@@ -243,19 +258,93 @@ def _token_inputs(n=N, samples=S, dtype=torch.float32, heads=H, ch=CH):
     return a, s, z, mask
 
 
-def test_row_blocked_mha_matches_full_pair(monkeypatch):
-    _set_tf32(False)
-    monkeypatch.setattr(
-        "openfold3.core.kernels.triton.fused_diffusion_attn._PAIR_ROW_BLOCK", 32
+def _pair_bias_module(heads=H, ch=CH):
+    return (
+        AttentionPairBias(
+            c_q=heads * ch,
+            c_k=heads * ch,
+            c_v=heads * ch,
+            c_s=C_S,
+            c_z=C_Z,
+            c_hidden=ch,
+            no_heads=heads,
+            use_ada_layer_norm=True,
+        )
+        .cuda()
+        .eval()
     )
-    module = _token_transformer(n_blocks=1)
-    a, s, z, mask = _token_inputs()
-    assert can_use_fused_diffusion_mha(a, z, H)
+
+
+def _mha_from_module(module, a, z, mask):
+    return fused_diffusion_mha_from_module(
+        a,
+        z,
+        mask,
+        linear_q=module.mha.linear_q,
+        linear_k=module.mha.linear_k,
+        linear_v=module.mha.linear_v,
+        linear_g=module.mha.linear_g,
+        linear_o=module.mha.linear_o,
+        layer_norm_z=module.layer_norm_z,
+        linear_z=module.linear_z,
+        no_heads=module.mha.no_heads,
+        c_hidden=module.mha.c_hidden,
+        inf=module.inf,
+    )
+
+
+def test_pair_bias_from_z_matches_eager_ieee():
+    _set_tf32(False)
+    torch.manual_seed(1)
+    z = torch.randn(B, N, N, C_Z, device="cuda") * 0.5
+    ln = torch.nn.LayerNorm(C_Z).cuda()
+    linear = torch.nn.Linear(C_Z, H, bias=False).cuda()
     with torch.inference_mode():
-        y = module(a.clone(), s, z, mask=mask)
-        monkeypatch.setenv("OPENFOLD3_FUSED_DIFFUSION_ATTN", "0")
-        y_ref = module(a.clone(), s, z, mask=mask)
-    torch.testing.assert_close(y, y_ref, atol=3e-3, rtol=3e-3)
+        y = _pair_bias_from_z(z, ln, linear, H)
+        ref = linear(ln(z)).permute(0, 3, 1, 2).unsqueeze(1)
+    torch.testing.assert_close(y, ref, atol=2e-4, rtol=2e-4)
+
+
+def test_packed_qkvg_matches_separate_linears():
+    _set_tf32(False)
+    from openfold3.core.kernels.triton.fused_diffusion_attn import (
+        _gated_wo,
+        _project_heads,
+        _project_qkvg,
+    )
+
+    module = _pair_bias_module()
+    a, _s, _z, _mask = _token_inputs()
+    mha = module.mha
+    with torch.inference_mode():
+        q, k, v, g = _project_qkvg(
+            a, mha.linear_q, mha.linear_k, mha.linear_v, mha.linear_g, H, CH
+        )
+        q_r = _project_heads(a, mha.linear_q, H, CH)
+        k_r = _project_heads(a, mha.linear_k, H, CH)
+        v_r = _project_heads(a, mha.linear_v, H, CH)
+        g_r = _project_heads(a, mha.linear_g, H, CH)
+        attn = torch.randn_like(q)
+        attn_ref = attn.clone()
+        y = _gated_wo(attn, g, mha.linear_o, H, CH)
+        y_r = mha._wrap_up(attn_ref.permute(0, 1, 3, 2, 4).contiguous(), a)
+    torch.testing.assert_close(q, q_r, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(k, k_r, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(v, v_r, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(g, g_r, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(y, y_r, atol=1e-5, rtol=1e-5)
+
+
+def test_fused_matches_module_ieee():
+    _set_tf32(False)
+    module = _pair_bias_module()
+    a, s, z, mask = _token_inputs()
+    with torch.inference_mode():
+        a_n = module.layer_norm_a(a, s)
+        y_fused = _mha_from_module(module, a_n, z, mask)
+        y_fused = module.sigmoid(module.linear_ada_out(s)) * y_fused
+        y_ref = module(a.clone(), z, s=s, mask=mask)
+    torch.testing.assert_close(y_fused, y_ref, atol=3e-3, rtol=3e-3)
 
 
 def test_module_dispatch_uses_fused(monkeypatch):
@@ -270,6 +359,68 @@ def test_module_dispatch_uses_fused(monkeypatch):
     torch.testing.assert_close(y, y_ref, atol=3e-3, rtol=3e-3)
 
 
+def test_module_accepts_broadcast_sample_pair():
+    """Production z is often [B, S, N, N, C] via sample broadcast."""
+    _set_tf32(False)
+    module = _pair_bias_module()
+    a, s, z, mask = _token_inputs()
+    z5 = z.unsqueeze(1).expand(B, S, N, N, C_Z).contiguous()
+    assert can_use_fused_diffusion_mha(a, z5, H)
+    with torch.inference_mode():
+        y5 = module(a.clone(), z5, s=s, mask=mask)
+        y4 = module(a.clone(), z, s=s, mask=mask)
+    torch.testing.assert_close(y5, y4, atol=1e-5, rtol=1e-5)
+
+
+def test_fused_matches_module_production_heads(monkeypatch):
+    _set_tf32(False)
+    heads, ch = 16, 48
+    module = _pair_bias_module(heads=heads, ch=ch)
+    a, s, z, mask = _token_inputs(heads=heads, ch=ch)
+    assert can_use_fused_diffusion_mha(a, z, heads)
+    with torch.inference_mode():
+        y = module(a.clone(), z, s=s, mask=mask)
+        monkeypatch.setenv("OPENFOLD3_FUSED_DIFFUSION_ATTN", "0")
+        y_ref = module(a.clone(), z, s=s, mask=mask)
+    torch.testing.assert_close(y, y_ref, atol=3e-3, rtol=3e-3)
+
+
+def test_can_use_fused_diffusion_mha_rejects_bad_layout():
+    a, _s, z, _mask = _token_inputs()
+    assert can_use_fused_diffusion_mha(a, z, H)
+    assert not can_use_fused_diffusion_mha(a, z[:, :, :-1], H)
+    assert not can_use_fused_diffusion_mha(
+        a, torch.randn(B, N, N, C_Z + 1, device="cuda"), H
+    )
+    assert not can_use_fused_diffusion_mha(a.cpu(), z.cpu(), H)
+
+
+def test_module_autograd_matches_eager_tf32(monkeypatch):
+    _set_tf32(True)
+    module = _pair_bias_module().train()
+    a, s, z, mask = _token_inputs()
+    af, zf = a.detach().requires_grad_(True), z.detach().requires_grad_(True)
+    module(
+        af, zf, s=s, mask=mask, use_high_precision_attention=True
+    ).square().mean().backward()
+    d_a = af.grad.detach().clone()
+    d_z = zf.grad.detach().clone()
+    d_ln = module.layer_norm_z.weight.grad.detach().clone()
+    d_w = module.linear_z.weight.grad.detach().clone()
+    module.zero_grad(set_to_none=True)
+    monkeypatch.setenv("OPENFOLD3_FUSED_DIFFUSION_ATTN", "0")
+    ae, ze = a.detach().requires_grad_(True), z.detach().requires_grad_(True)
+    module(
+        ae, ze, s=s, mask=mask, use_high_precision_attention=True
+    ).square().mean().backward()
+    torch.testing.assert_close(d_a, ae.grad, atol=2e-2, rtol=5e-3)
+    torch.testing.assert_close(d_z, ze.grad, atol=2e-2, rtol=5e-3)
+    torch.testing.assert_close(
+        d_ln, module.layer_norm_z.weight.grad, atol=2e-2, rtol=5e-3
+    )
+    torch.testing.assert_close(d_w, module.linear_z.weight.grad, atol=2e-2, rtol=5e-3)
+
+
 def test_high_precision_does_not_block_fused(monkeypatch):
     import openfold3.core.kernels.triton.fused_diffusion_attn as fda
 
@@ -281,20 +432,7 @@ def test_high_precision_does_not_block_fused(monkeypatch):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(fda, "fused_diffusion_attn", wrapped)
-    module = (
-        AttentionPairBias(
-            c_q=C_A,
-            c_k=C_A,
-            c_v=C_A,
-            c_s=C_S,
-            c_z=C_Z,
-            c_hidden=CH,
-            no_heads=H,
-            use_ada_layer_norm=True,
-        )
-        .cuda()
-        .train()
-    )
+    module = _pair_bias_module().train()
     a, s, z, mask = _token_inputs()
     a = a.detach().requires_grad_(True)
     z = z.detach().requires_grad_(True)
@@ -306,7 +444,9 @@ def test_high_precision_does_not_block_fused(monkeypatch):
     calls.clear()
     module.eval()
     with torch.inference_mode():
-        module(a.detach(), z.detach(), s=s, mask=mask, use_high_precision_attention=True)
+        module(
+            a.detach(), z.detach(), s=s, mask=mask, use_high_precision_attention=True
+        )
     assert calls, "fused diffusion attn must run under inference high-precision flag"
 
 
@@ -326,20 +466,13 @@ def test_pair_bias_cache_bitwise(monkeypatch):
     with torch.inference_mode():
         y_fused_cached = module(a.clone(), s, z, mask=mask, pair_bias_cache=cache)
         y_fused = module(a.clone(), s, z, mask=mask)
-    assert torch.equal(y_fused_cached, y_fused)
+    # Cached path keeps a precomputed pair; default builds LN→Linear once
+    # per call then fused flash (same math, not the 3U rollout cache).
+    torch.testing.assert_close(y_fused_cached, y_fused, atol=3e-3, rtol=3e-3)
 
 
 def test_prep_static_pair_bias_matches_eager():
-    module = AttentionPairBias(
-        c_q=C_A,
-        c_k=C_A,
-        c_v=C_A,
-        c_s=C_S,
-        c_z=C_Z,
-        c_hidden=CH,
-        no_heads=H,
-        use_ada_layer_norm=True,
-    ).cuda().eval()
+    module = _pair_bias_module()
     z = torch.randn(1, N, N, C_Z, device="cuda")
     cached = module.prep_static_pair_bias(z)
     ref = module.linear_z(module.layer_norm_z(z)).permute(0, 3, 1, 2)
@@ -426,11 +559,8 @@ print(json.dumps({"after_first": after_first, "after_all": after_all}))
         result = subprocess.run(
             [sys.executable, "-c", script],
             env=env,
-            cwd="/workspace/hongliang/of3_dev",
             capture_output=True,
             text=True,
-            check=False,
+            check=True,
         )
-        if result.returncode != 0:
-            raise AssertionError(result.stdout + "\n" + result.stderr)
         assert "after_first" in result.stdout

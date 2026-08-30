@@ -18,6 +18,9 @@
 Production token path: ``c_a=768``, ``c_hidden=48``, ``H=16``, ``c_z=128``.
 Reports warm wall time and peak-above-input U. Pair-bias cache is a
 separate opt-in (3U resident).
+
+Module-path inference reports eager vs fused (one-shot
+``_pair_bias_from_z`` + ``fused_diffusion_attn``).
 """
 
 from __future__ import annotations
@@ -97,10 +100,6 @@ def _peak_u(fn, n: int) -> float:
     return max(0.0, (torch.cuda.max_memory_allocated() - base) / _u(n))
 
 
-def _input_bytes(*tensors: torch.Tensor) -> int:
-    return sum(t.numel() * t.element_size() for t in tensors)
-
-
 def _leaves(*tensors: torch.Tensor):
     return [t.detach().requires_grad_(True) for t in tensors]
 
@@ -110,7 +109,7 @@ def _bench_train(args) -> None:
         f"{'prec':<12}{'S':>4}{'N':>6}{'eager_ms':>10}{'fused_ms':>10}"
         f"{'speedup':>8}{'eager_U':>9}{'fused_U':>9}"
     )
-    print("TRAINING SCORES PATH (fwd+bwd; S is the training sample dim, not inference 1/5)")
+    print("TRAINING SCORES PATH (fwd+bwd; S is training samples, not infer 1/5)")
     print(header)
     for prec, dtype, tf32 in (
         ("tf32", torch.float32, True),
@@ -123,7 +122,16 @@ def _bench_train(args) -> None:
                 q0, k0, v0, mask, p0, scale = _tensors(n, samples, dtype)
                 go = torch.randn_like(q0)
 
-                def run(attn):
+                def run(
+                    attn,
+                    q0=q0,
+                    k0=k0,
+                    v0=v0,
+                    p0=p0,
+                    mask=mask,
+                    scale=scale,
+                    go=go,
+                ):
                     q, k, v, p = _leaves(q0, k0, v0, p0)
                     attn(q, k, v, mask, p, scale).backward(go)
 
@@ -176,9 +184,12 @@ def _bench_train(args) -> None:
                 a0, s0, z0, mask = _module_tensors(n, samples, dtype)
                 go = torch.randn_like(a0)
 
-                def run(flag):
+                def run_module(flag, a0=a0, s0=s0, z0=z0, mask=mask, go=go):
                     os.environ["OPENFOLD3_FUSED_DIFFUSION_ATTN"] = flag
-                    a, z = a0.detach().requires_grad_(True), z0.detach().requires_grad_(True)
+                    a, z = (
+                        a0.detach().requires_grad_(True),
+                        z0.detach().requires_grad_(True),
+                    )
                     module(
                         a,
                         z,
@@ -189,10 +200,10 @@ def _bench_train(args) -> None:
                     module.zero_grad(set_to_none=True)
 
                 def eager():
-                    run("0")
+                    run_module("0")
 
                 def fused():
-                    run("1")
+                    run_module("1")
 
                 for _ in range(max(2, WARMUP // 2)):
                     fused()
@@ -244,12 +255,11 @@ def main():
         for samples in args.samples:
             for n in args.n:
                 q, k, v, mask, pair, scale = _tensors(n, samples, dtype)
-                baseline = _input_bytes(q, k, v, mask, pair)
 
-                def eager():
+                def eager(q=q, k=k, v=v, mask=mask, pair=pair, scale=scale):
                     return eager_diffusion_attn(q, k, v, mask, pair, scale)
 
-                def fused():
+                def fused(q=q, k=k, v=v, mask=mask, pair=pair, scale=scale):
                     return fused_diffusion_attn(q, k, v, mask, pair, scale)
 
                 with torch.inference_mode():
@@ -269,8 +279,9 @@ def main():
         return
 
     print()
-    print("MODULE PATH (AttentionPairBias: AdaLN + pair LN/Linear + QKV + attn + gate + Wo)")
+    print("MODULE PATH (AttentionPairBias: AdaLN + QKV + attn + gate + Wo)")
     print(header)
+    os.environ["OPENFOLD3_DIFFUSION_PAIR_BIAS_CACHE"] = "0"
     for prec, dtype, tf32 in (
         ("tf32", torch.float32, True),
         ("bf16-mixed", torch.bfloat16, False),
@@ -292,21 +303,15 @@ def main():
             .to(dtype=torch.float32)
             .eval()
         )
-        if dtype == torch.bfloat16:
-            # fp32 Parameter masters; activations bf16
-            pass
         for samples in args.samples:
             for n in args.n:
                 a, s, z, mask = _module_tensors(n, samples, dtype)
-                baseline = _input_bytes(a, s, z, mask) + sum(
-                    p.numel() * p.element_size() for p in module.parameters()
-                )
 
-                def eager():
+                def eager(module=module, a=a, z=z, s=s, mask=mask):
                     os.environ["OPENFOLD3_FUSED_DIFFUSION_ATTN"] = "0"
                     return module(a, z, s=s, mask=mask)
 
-                def fused():
+                def fused(module=module, a=a, z=z, s=s, mask=mask):
                     os.environ["OPENFOLD3_FUSED_DIFFUSION_ATTN"] = "1"
                     return module(a, z, s=s, mask=mask)
 

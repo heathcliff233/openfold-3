@@ -23,15 +23,15 @@ K/V with an additive pair bias and mask. ``N_Q`` / ``N_K`` / ``S`` /
 strides are not autotune or specialize keys. The ``[B, S, H, N_Q, N_K]``
 score matrix is never stored.
 
-One program owns a Q-tile of one ``(b, s, h)``. Training writes ``dBias``
-into ``[B, S_pb, H, N_Q, N_K]`` (``S_pb`` is 1 when pair bias is shared)
-by looping ``S`` in the exclusive ``dQ`` program — no ``[B, S, H, N, N]``
-scratch and no atomics.
+One program owns a Q-tile of one ``(b, s, h)`` (FlashAttention-2
+partitioning): ``Q`` and the online-softmax state stay in SRAM for the
+K-loop. Pair bias is the one-shot ``LN_z → Linear_z`` output
+(``[B, 1, H, N, N]``). Training writes exclusive ``dBias`` — no atomics.
 
-The module path projects pair bias with ``LN_z → Linear_z`` from a
-packed view of ``z`` (no row clone). The live pair is ``[H, N, N]`` =
-0.125U. Q/K/V keep native strides. AdaLN and ada-out stay on the eager
-module. Ineligible shapes use the matching-precision eager einsum.
+AdaLN stays eager. Inference packs ``QKVG`` in one GEMM and applies
+gate ⊙ ``W_o`` in place; training keeps separate projections so
+autograd hits the fp32 Parameter masters. Ineligible shapes use the
+matching-precision eager einsum.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ import math
 import os
 
 import torch
+import torch.nn.functional as F
 from torch.autograd.function import once_differentiable
 
 try:
@@ -54,21 +55,21 @@ except ImportError:  # pragma: no cover
 
 _TRUE = {"1", "true", "yes", "on"}
 _MAX_CH = 128
+_MAX_CZ = 128
 _MIN_BLOCK_C = 16
 _DEFAULT_MIN_TOKENS = 0
-# Production token lengths are one-shot. Row-streaming clones ``z``
-# slices (``ROW / N`` U) and is slower than the 0.125U Linear output.
-_PAIR_ROW_BLOCK = 4096
 
 
 def is_fused_diffusion_attn_enabled() -> bool:
-    return os.environ.get("OPENFOLD3_FUSED_DIFFUSION_ATTN", "1").strip().lower() in _TRUE
+    return (
+        os.environ.get("OPENFOLD3_FUSED_DIFFUSION_ATTN", "1").strip().lower() in _TRUE
+    )
 
 
 def is_diffusion_pair_bias_cache_enabled() -> bool:
-    return os.environ.get("OPENFOLD3_DIFFUSION_PAIR_BIAS_CACHE", "0").strip().lower() in (
-        _TRUE
-    )
+    return os.environ.get(
+        "OPENFOLD3_DIFFUSION_PAIR_BIAS_CACHE", "0"
+    ).strip().lower() in (_TRUE)
 
 
 def fused_diffusion_attn_min_tokens() -> int:
@@ -417,7 +418,7 @@ if _TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
-        """One program owns a Q-row tile of one ``(b, s, h)``."""
+        """One ``(b, s, h)`` Q-tile. ``Q`` / ``m`` / ``ℓ`` / ``O`` stay in SRAM."""
         pid_m = tl.program_id(0)
         pid_bsh = tl.program_id(1)
         h = pid_bsh % H
@@ -428,24 +429,25 @@ if _TRITON_AVAILABLE:
         mask_m = offs_m < N_Q
         mask_c = offs_c < CH
         rcp = RCP_LN2
-        q_base = b * stride_qb + s * stride_qs + h * stride_qh
-        k_base = b * stride_kb + s * stride_ks + h * stride_kh
-        v_base = b * stride_vb + s * stride_vs + h * stride_vh
-        o_base = b * stride_ob + s * stride_os + h * stride_oh
-        pb_base = b * stride_pb_b + s * stride_pb_s + h * stride_pb_h
-        mb_base = b * stride_mb_b + s * stride_mb_s
+        m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+        l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_M, BLOCK_C), dtype=tl.float32)
         q = tl.load(
             Q_ptr
-            + q_base
+            + b * stride_qb
+            + s * stride_qs
+            + h * stride_qh
             + offs_m[:, None] * stride_qn
             + offs_c[None, :] * stride_qc,
             mask=mask_m[:, None] & mask_c[None, :],
             other=0.0,
         )
-        m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
-        l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        acc = tl.zeros((BLOCK_M, BLOCK_C), dtype=tl.float32)
-        for n0 in range(0, N_K, BLOCK_N):
+        k_base = b * stride_kb + s * stride_ks + h * stride_kh
+        v_base = b * stride_vb + s * stride_vs + h * stride_vh
+        o_base = b * stride_ob + s * stride_os + h * stride_oh
+        pb_base = b * stride_pb_b + s * stride_pb_s + h * stride_pb_h
+        mb_base = b * stride_mb_b + s * stride_mb_s
+        for n0 in tl.range(0, N_K, BLOCK_N, num_stages=2):
             offs_n = n0 + tl.arange(0, BLOCK_N)
             mask_n = offs_n < N_K
             k = tl.load(
@@ -465,7 +467,9 @@ if _TRITON_AVAILABLE:
                 mask=mask_m[:, None] & mask_n[None, :],
                 other=0.0,
             ).to(tl.float32)
-            mb = tl.load(MB_ptr + mb_base + offs_n * stride_mb_k, mask=mask_n, other=0.0)
+            mb = tl.load(
+                MB_ptr + mb_base + offs_n * stride_mb_k, mask=mask_n, other=0.0
+            )
             qk = qk + (pb + mb.to(tl.float32)[None, :]) * rcp
             qk = tl.where(mask_n[None, :], qk, float("-inf"))
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
@@ -486,15 +490,16 @@ if _TRITON_AVAILABLE:
         acc = acc / l_i[:, None]
         if WRITE_LSE:
             tl.store(
-                LSE_ptr + b * stride_lse_b + s * stride_lse_s + h * stride_lse_h + offs_m,
+                LSE_ptr
+                + b * stride_lse_b
+                + s * stride_lse_s
+                + h * stride_lse_h
+                + offs_m,
                 m_i + tl.math.log2(l_i),
                 mask=mask_m,
             )
         tl.store(
-            O_ptr
-            + o_base
-            + offs_m[:, None] * stride_on
-            + offs_c[None, :] * stride_oc,
+            O_ptr + o_base + offs_m[:, None] * stride_on + offs_c[None, :] * stride_oc,
             acc.to(O_ptr.dtype.element_ty),
             mask=mask_m[:, None] & mask_c[None, :],
         )
@@ -631,7 +636,7 @@ if _TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
-        """Exclusive ``dQ`` (+ optional ``dBias``) for one ``(b, h)`` Q-tile."""
+        """Exclusive ``dQ``. Pair path may write ``dBias``."""
         pid_m = tl.program_id(0)
         pid_bh = tl.program_id(1)
         h = pid_bh % H
@@ -670,7 +675,7 @@ if _TRITON_AVAILABLE:
             lse = tl.load(LSE_ptr + lse_base + offs_m, mask=mask_m, other=0.0)
             delta = tl.load(Delta_ptr + del_base + offs_m, mask=mask_m, other=0.0)
             dq = tl.zeros((BLOCK_M, BLOCK_C), dtype=tl.float32)
-            for n0 in range(0, N_K, BLOCK_N):
+            for n0 in tl.range(0, N_K, BLOCK_N, num_stages=2):
                 offs_n = n0 + tl.arange(0, BLOCK_N)
                 mask_n = offs_n < N_K
                 tile = mask_m[:, None] & mask_n[None, :]
@@ -884,25 +889,19 @@ if _TRITON_AVAILABLE:
         lse_base = b * stride_lse_b + s * stride_lse_s + h * stride_lse_h
         del_base = b * stride_del_b + s * stride_del_s + h * stride_del_h
         k = tl.load(
-            K_ptr
-            + k_base
-            + offs_n[:, None] * stride_kn
-            + offs_c[None, :] * stride_kc,
+            K_ptr + k_base + offs_n[:, None] * stride_kn + offs_c[None, :] * stride_kc,
             mask=mask_n[:, None] & mask_c[None, :],
             other=0.0,
         )
         v = tl.load(
-            V_ptr
-            + v_base
-            + offs_n[:, None] * stride_vn
-            + offs_c[None, :] * stride_vc,
+            V_ptr + v_base + offs_n[:, None] * stride_vn + offs_c[None, :] * stride_vc,
             mask=mask_n[:, None] & mask_c[None, :],
             other=0.0,
         )
         mb = tl.load(MB_ptr + mb_base + offs_n * stride_mb_k, mask=mask_n, other=0.0)
         dk = tl.zeros((BLOCK_N, BLOCK_C), dtype=tl.float32)
         dv = tl.zeros((BLOCK_N, BLOCK_C), dtype=tl.float32)
-        for m0 in range(0, N_Q, BLOCK_M):
+        for m0 in tl.range(0, N_Q, BLOCK_M, num_stages=2):
             offs_m = m0 + tl.arange(0, BLOCK_M)
             mask_m = offs_m < N_Q
             tile = mask_m[:, None] & mask_n[None, :]
@@ -978,7 +977,9 @@ def _sample_stride(tensor: torch.Tensor, samples: int, dim: int = 1) -> int:
 def _launch_delta(out: torch.Tensor, grad_out: torch.Tensor) -> torch.Tensor:
     """Row-wise ``(dO * O).sum(-1)`` in fp32. Does not materialize a C-wide product."""
     bsz, samples, heads, n_q, ch = out.shape
-    delta = torch.empty(bsz, samples, heads, n_q, device=out.device, dtype=torch.float32)
+    delta = torch.empty(
+        bsz, samples, heads, n_q, device=out.device, dtype=torch.float32
+    )
     _attn_delta_kernel[(bsz * samples * heads * n_q,)](
         out,
         grad_out,
@@ -1025,7 +1026,9 @@ def _launch_fwd(
     out = torch.empty_like(q)
     lse = None
     if write_lse:
-        lse = torch.empty(bsz, samples, heads, n_q, device=q.device, dtype=torch.float32)
+        lse = torch.empty(
+            bsz, samples, heads, n_q, device=q.device, dtype=torch.float32
+        )
     grid = (triton.cdiv(n_q, block_m), bsz * samples * heads)
     _flash_diffusion_attn_fwd_kernel[grid](
         q,
@@ -1111,10 +1114,12 @@ def _launch_bwd(
             device=q.device,
             dtype=torch.float32,
         )
+    dummy = q
     delta = _launch_delta(out, grad_out)
-    block_m, block_n, warps, stages = _bwd_dq_tiles(gemm_mode)
     block_c = _block_c(ch)
-    q_grid = (triton.cdiv(n_q, block_m), bsz * heads)
+    block_m, block_n, warps, stages = _bwd_dq_tiles(gemm_mode)
+    n_tiles = triton.cdiv(n_q, block_m)
+    q_grid = (n_tiles, bsz * heads)
     _flash_diffusion_attn_bwd_dq_kernel[q_grid](
         q,
         k,
@@ -1125,7 +1130,7 @@ def _launch_bwd(
         pair_bias,
         mask_bias,
         dq,
-        d_pair_full if d_pair_full is not None else q,
+        d_pair_full if d_pair_full is not None else dummy,
         n_q,
         n_k,
         samples,
@@ -1164,11 +1169,7 @@ def _launch_bwd(
         _sample_stride(mask_bias, samples),
         mask_bias.stride(-1),
         d_pair_full.stride(0) if d_pair_full is not None else 0,
-        (
-            _sample_stride(d_pair_full, samples)
-            if d_pair_full is not None
-            else 0
-        ),
+        (_sample_stride(d_pair_full, samples) if d_pair_full is not None else 0),
         d_pair_full.stride(2) if d_pair_full is not None else 0,
         d_pair_full.stride(3) if d_pair_full is not None else 0,
         d_pair_full.stride(4) if d_pair_full is not None else 1,
@@ -1330,10 +1331,6 @@ def fused_diffusion_attn(
     return out
 
 
-def _pair_row_block(n_tok: int) -> int:
-    return n_tok if n_tok <= _PAIR_ROW_BLOCK else _PAIR_ROW_BLOCK
-
-
 def _pair_ln_linear_rows(z_rows: torch.Tensor, layer_norm, linear) -> torch.Tensor:
     from openfold3.core.kernels.triton.fused_ln_linear import (
         fused_ln_linear,
@@ -1365,6 +1362,37 @@ def _pair_bias_from_z(
     return pb.view(bsz, n_q, n_k, no_heads).permute(0, 3, 1, 2).unsqueeze(1)
 
 
+def _shared_pair_z(z: torch.Tensor, a: torch.Tensor) -> torch.Tensor | None:
+    """Normalize pair to ``[B, N, N, C_z]`` for the fused module path.
+
+    Diffusion often broadcasts a sample axis onto ``z`` (``[B, S, N, N, C]``).
+    Pair conditioning does not vary across denoising samples at a step, so
+    ``z[:, 0]`` is the shared pair. Returns ``None`` if the layout is wrong.
+    """
+    if a.ndim != 4:
+        return None
+    bsz, _samples, n_tok, _c_a = a.shape
+    if z.ndim == 4:
+        if (
+            z.shape[0] == bsz
+            and z.shape[1] == n_tok
+            and z.shape[2] == n_tok
+            and z.shape[-1] <= _MAX_CZ
+        ):
+            return z
+        return None
+    if (
+        z.ndim == 5
+        and z.shape[0] == bsz
+        and z.shape[1] >= 1
+        and z.shape[2] == n_tok
+        and z.shape[3] == n_tok
+        and z.shape[-1] <= _MAX_CZ
+    ):
+        return z[:, 0]
+    return None
+
+
 def can_use_fused_diffusion_mha(
     a: torch.Tensor,
     z: torch.Tensor,
@@ -1378,12 +1406,10 @@ def can_use_fused_diffusion_mha(
         or not _TRITON_AVAILABLE
         or not a.is_cuda
         or a.ndim != 4
-        or z.ndim != 4
         or a.dtype not in (torch.float32, torch.bfloat16)
-        or z.shape[0] != a.shape[0]
-        or z.shape[1] != a.shape[2]
-        or z.shape[2] != a.shape[2]
     ):
+        return False
+    if _shared_pair_z(z, a) is None and cached_pair_bias_h is None:
         return False
     _bsz, _samples, n_tok, c_a = a.shape
     if c_a % no_heads != 0:
@@ -1409,6 +1435,78 @@ def _project_heads(
     return y.view(*y.shape[:-1], no_heads, c_hidden).permute(0, 1, 3, 2, 4)
 
 
+def _qkvg_pack_wins(a: torch.Tensor, linear_q) -> bool:
+    """Skip packing when the cat weight buffer would dominate the peak.
+
+    Packed activations and the cat both scale with the number of
+    projections, so the test is ``numel(a) >= numel(W_q)``. Do not cache
+    the packed weights: each diffusion layer would keep another full
+    ``QKVG`` copy resident.
+    """
+    return a.numel() >= linear_q.weight.numel()
+
+
+def _project_qkvg(
+    a: torch.Tensor,
+    linear_q,
+    linear_k,
+    linear_v,
+    linear_g,
+    no_heads: int,
+    c_hidden: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """One GEMM for ``Q/K/V[/G]``. Inference-only; weights may be downcast."""
+    weights = [linear_q.weight, linear_k.weight, linear_v.weight]
+    linears = [linear_q, linear_k, linear_v]
+    if linear_g is not None:
+        weights.append(linear_g.weight)
+        linears.append(linear_g)
+    w = torch.cat(weights, dim=0)
+    if w.dtype != a.dtype:
+        w = w.to(dtype=a.dtype)
+    bias = None
+    if any(lin.bias is not None for lin in linears):
+        chunks = []
+        for lin in linears:
+            rows = lin.weight.shape[0]
+            if lin.bias is None:
+                chunks.append(w.new_zeros(rows))
+            elif lin.bias.dtype != a.dtype:
+                chunks.append(lin.bias.to(dtype=a.dtype))
+            else:
+                chunks.append(lin.bias)
+        bias = torch.cat(chunks, dim=0)
+    packed = F.linear(a, w, bias)
+    width = no_heads * c_hidden
+    parts = packed.split(width, dim=-1)
+
+    def as_heads(t: torch.Tensor) -> torch.Tensor:
+        return t.view(*t.shape[:-1], no_heads, c_hidden).permute(0, 1, 3, 2, 4)
+
+    g = as_heads(parts[3]) if linear_g is not None else None
+    return as_heads(parts[0]), as_heads(parts[1]), as_heads(parts[2]), g
+
+
+def _gated_wo(
+    attn: torch.Tensor,
+    g: torch.Tensor | None,
+    linear_o,
+    no_heads: int,
+    c_hidden: int,
+) -> torch.Tensor:
+    """``W_o(sigmoid(G) ⊙ O)`` without a second gated copy of ``O``."""
+    # attn / g are [B, S, H, N, C]; wrap_up uses [B, S, N, H, C].
+    # permute().contiguous() is a no-op (and aliases ``attn``) when ``attn``
+    # already has wrap_up storage — e.g. ``randn_like`` of a Q permute-view.
+    o = attn.permute(0, 1, 3, 2, 4).contiguous()
+    if o.data_ptr() == attn.data_ptr():
+        o = o.clone()
+    if g is not None:
+        gate = torch.sigmoid(g.permute(0, 1, 3, 2, 4).contiguous())
+        o.mul_(gate)
+    return linear_o(o.reshape(*o.shape[:-2], no_heads * c_hidden))
+
+
 def fused_diffusion_mha_from_module(
     a: torch.Tensor,
     z: torch.Tensor,
@@ -1426,45 +1524,48 @@ def fused_diffusion_mha_from_module(
     inf: float,
     cached_pair_bias_h: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Inference MHA: pair ``LN → Linear``, flash, gate, ``W_o``.
+    """MHA: one-shot pair ``LN → Linear`` then fused flash, then gate / ``W_o``.
 
-    ``a`` is post-AdaLN. Pair bias is the 0.125U Linear output from a
-    packed view of ``z``. A Q-row loop remains only when
-    ``_PAIR_ROW_BLOCK`` is patched below ``N`` (tests).
+    ``a`` is post-AdaLN. Builds a transient ``[B, 1, H, N, N]`` pair
+    (~0.125U fp32 / ~0.0625U bf16) unless ``cached_pair_bias_h`` is
+    supplied — not the 3U rollout cache. Inference packs ``QKVG`` when
+    the cat weight buffer is not the peak, and fuses gate ⊙ ``W_o``.
+    AdaLN and ada-out stay on the eager module.
     """
-    bsz, samples, n_tok, c_a = a.shape
     scale = 1.0 / math.sqrt(c_hidden)
     if mask is None:
         mask = a.new_ones(a.shape[:-1])
     mask = mask.expand(a.shape[:-1])
     mask_bias = (inf * (mask - 1))[..., None, None, :]
 
-    k = _project_heads(a, linear_k, no_heads, c_hidden)
-    v = _project_heads(a, linear_v, no_heads, c_hidden)
-
-    def _finish(attn_heads: torch.Tensor, a_rows: torch.Tensor) -> torch.Tensor:
-        o = attn_heads.transpose(-2, -3)
-        if linear_g is not None:
-            g = torch.sigmoid(linear_g(a_rows))
-            o = o * g.view(*g.shape[:-1], no_heads, c_hidden)
-        return linear_o(o.reshape(*o.shape[:-2], no_heads * c_hidden))
+    infer = not torch.is_grad_enabled()
+    g = None
+    if infer and _qkvg_pack_wins(a, linear_q):
+        q, k, v, g = _project_qkvg(
+            a, linear_q, linear_k, linear_v, linear_g, no_heads, c_hidden
+        )
+    else:
+        q = _project_heads(a, linear_q, no_heads, c_hidden)
+        k = _project_heads(a, linear_k, no_heads, c_hidden)
+        v = _project_heads(a, linear_v, no_heads, c_hidden)
+        if infer and linear_g is not None:
+            g = _project_heads(a, linear_g, no_heads, c_hidden)
 
     if cached_pair_bias_h is not None:
         pair = cached_pair_bias_h.unsqueeze(1)
-        q = _project_heads(a, linear_q, no_heads, c_hidden)
-        return _finish(fused_diffusion_attn(q, k, v, mask_bias, pair, scale), a)
-
-    row = _pair_row_block(n_tok)
-    if row >= n_tok:
-        q = _project_heads(a, linear_q, no_heads, c_hidden)
-        pair = _pair_bias_from_z(z, layer_norm_z, linear_z, no_heads)
-        return _finish(fused_diffusion_attn(q, k, v, mask_bias, pair, scale), a)
-
-    out = a.new_empty(bsz, samples, n_tok, c_a)
-    for i0 in range(0, n_tok, row):
-        i1 = min(n_tok, i0 + row)
-        pair = _pair_bias_from_z(z[:, i0:i1], layer_norm_z, linear_z, no_heads)
-        q = _project_heads(a[:, :, i0:i1], linear_q, no_heads, c_hidden)
-        attn = fused_diffusion_attn(q, k, v, mask_bias, pair, scale)
-        out[:, :, i0:i1] = _finish(attn, a[:, :, i0:i1])
-    return out
+    else:
+        z_pair = _shared_pair_z(z, a)
+        if z_pair is None:
+            raise RuntimeError(
+                "fused_diffusion_mha_from_module requires z as [B,N,N,C] "
+                "or broadcast [B,S,N,N,C]"
+            )
+        pair = _pair_bias_from_z(z_pair, layer_norm_z, linear_z, no_heads)
+    attn = fused_diffusion_attn(q, k, v, mask_bias, pair, scale)
+    if infer:
+        return _gated_wo(attn, g, linear_o, no_heads, c_hidden)
+    o = attn.transpose(-2, -3)
+    if linear_g is not None:
+        gate = torch.sigmoid(linear_g(a))
+        o = o * gate.view(*gate.shape[:-1], no_heads, c_hidden)
+    return linear_o(o.reshape(*o.shape[:-2], no_heads * c_hidden))

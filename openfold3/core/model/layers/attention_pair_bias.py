@@ -53,9 +53,7 @@ def _unsqueeze_bias_sample(bias: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
     if n_extra <= 0:
         return bias
     head_pos = bias.dim() - 3
-    return bias.view(
-        bias.shape[:head_pos] + (1,) * n_extra + bias.shape[head_pos:]
-    )
+    return bias.view(bias.shape[:head_pos] + (1,) * n_extra + bias.shape[head_pos:])
 
 
 class AttentionPairBias(nn.Module):
@@ -245,7 +243,7 @@ class AttentionPairBias(nn.Module):
             or use_triton_triangle_kernels
             or use_lma
         )
-        if not use_alt and not torch.is_grad_enabled():
+        if not use_alt:
             from openfold3.core.kernels.triton.fused_diffusion_attn import (
                 can_use_fused_diffusion_mha,
                 fused_diffusion_mha_from_module,
