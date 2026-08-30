@@ -51,6 +51,18 @@ class TestPredictedAlignedErrorHead(unittest.TestCase):
         expected_shape = (batch_size, n_token, n_token, c_out)
         np.testing.assert_array_equal(out.shape, expected_shape)
 
+    def test_streamed_matches_eager(self):
+        torch.manual_seed(0)
+        n, c_z, c_out = 160, 32, 16
+        head = PredictedAlignedErrorHead(c_z, c_out)
+        initialize_model_weights(head)
+        zij = torch.randn(2, n, n, c_z)
+        with torch.inference_mode():
+            streamed = head(zij)
+        with torch.enable_grad():
+            eager = head(zij)
+        torch.testing.assert_close(streamed, eager.detach(), atol=1e-5, rtol=1e-5)
+
 
 class TestPredictedDistanceErrorHead(unittest.TestCase):
     def test_predicted_distance_error_head_shape(self):
@@ -67,6 +79,38 @@ class TestPredictedDistanceErrorHead(unittest.TestCase):
 
         expected_shape = (batch_size, n_token, n_token, c_out)
         np.testing.assert_array_equal(out.shape, expected_shape)
+
+    def test_streamed_matches_eager(self):
+        torch.manual_seed(0)
+        n, c_z, c_out = 160, 32, 16
+        head = PredictedDistanceErrorHead(c_z, c_out)
+        initialize_model_weights(head)
+        zij = torch.randn(2, n, n, c_z)
+        with torch.inference_mode():
+            streamed = head(zij)
+        with torch.enable_grad():
+            eager = head(zij)
+        torch.testing.assert_close(streamed, eager.detach(), atol=1e-5, rtol=1e-5)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestPairHeadStreamingPeak(unittest.TestCase):
+    def test_pae_inference_peak_below_eager_ln(self):
+        n, c_z, c_out = 256, 128, 64
+        u = n * n * c_z * 4
+        head = PredictedAlignedErrorHead(c_z, c_out).cuda().eval()
+        initialize_model_weights(head)
+        zij = torch.randn(1, n, n, c_z, device="cuda")
+        with torch.inference_mode():
+            head(zij)
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            base = torch.cuda.memory_allocated()
+            head(zij)
+            torch.cuda.synchronize()
+            peak_u = (torch.cuda.max_memory_allocated() - base) / u
+        # Logits 0.5U + 128-row LN slab + Linear tile, not a 1U LN pair.
+        self.assertLess(peak_u, 1.4)
 
 
 class TestPLDDTHead(unittest.TestCase):

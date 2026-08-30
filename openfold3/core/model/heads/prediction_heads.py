@@ -361,6 +361,53 @@ class PairformerEmbedding(nn.Module):
         return si, zij
 
 
+# Inference-only pair-head tile. Matches other pair caps; do not lift.
+_CONFIDENCE_ROW_BLOCK = 128
+
+
+def _streamed_pair_head_logits(
+    layer_norm: nn.Module,
+    linear: nn.Module,
+    zij: torch.Tensor,
+    c_out: int,
+    *,
+    add_transpose: bool,
+    row_block: int = _CONFIDENCE_ROW_BLOCK,
+) -> torch.Tensor:
+    """``Linear(LN(zij))`` [+ transpose] without a full-pair LN buffer.
+
+    Training keeps the eager path so autograd saves one LN activation.
+    Inference streams samples and I-rows; PDE rematerializes the J-slab
+    so ``f(z) + f(z)^T`` does not keep a second full logit tensor.
+    """
+    n = zij.shape[-2]
+    if zij.shape[-3] != n:
+        raise ValueError(
+            f"pair head expects square [..., N, N, C], got {tuple(zij.shape)}"
+        )
+    if torch.is_grad_enabled():
+        logits = linear(layer_norm(zij))
+        if add_transpose:
+            logits = logits + logits.transpose(-2, -3)
+        return logits
+
+    leading = zij.shape[:-3]
+    z = zij.reshape(-1, n, n, zij.shape[-1])
+    out = z.new_empty(z.shape[0], n, n, c_out)
+    for s in range(z.shape[0]):
+        zs = z[s]
+        for i0 in range(0, n, row_block):
+            i1 = min(n, i0 + row_block)
+            ln_ij = layer_norm(zs[i0:i1])
+            out[s, i0:i1] = linear(ln_ij)
+            del ln_ij
+            if add_transpose:
+                ln_ji = layer_norm(zs[:, i0:i1].contiguous())
+                out[s, i0:i1] += linear(ln_ji).transpose(-2, -3)
+                del ln_ji
+    return out.view(*leading, n, n, c_out)
+
+
 class PredictedAlignedErrorHead(nn.Module):
     """
     Implements PredictedAlignedError Head (Algorithm 31, Line 5) for
@@ -392,23 +439,9 @@ class PredictedAlignedErrorHead(nn.Module):
         self.linear = Linear(self.c_z, self.c_out, **linear_init_params.linear)
 
     def _compute_logits(self, zij: torch.Tensor):
-        logits = self.linear(self.layer_norm(zij))
-        return logits
-
-    def _chunk(
-        self,
-        zij: torch.Tensor,
-    ) -> torch.Tensor:
-        zij_out = torch.zeros(
-            (*zij.shape[:-1], self.c_out), device=zij.device, dtype=zij.dtype
+        return _streamed_pair_head_logits(
+            self.layer_norm, self.linear, zij, self.c_out, add_transpose=False
         )
-        no_samples = zij.shape[-4]
-        for i in range(no_samples):
-            zij_out[..., i : i + 1, :, :, :] = self._compute_logits(
-                zij[..., i : i + 1, :, :, :]
-            )
-
-        return zij_out
 
     def forward(self, zij, apply_per_sample: bool = False):
         """
@@ -416,20 +449,13 @@ class PredictedAlignedErrorHead(nn.Module):
             zij:
                 [*, N, N, C_z] Pair embedding
             apply_per_sample:
-                Run PAE head for each sample individually.
-                This is a memory optimization which is only used during
-                validation/inference and will depend on the number of samples
-                in the full rollout.
+                Kept for call-site compatibility. Inference already streams
+                samples and I-rows inside ``_compute_logits``.
         Returns:
             logits:
                 [*, N, N, C_out] Logits
         """
-        if apply_per_sample:
-            logits = self._chunk(zij=zij)
-        else:
-            logits = self._compute_logits(zij=zij)
-
-        return logits
+        return self._compute_logits(zij=zij)
 
 
 class PredictedDistanceErrorHead(nn.Module):
@@ -463,24 +489,9 @@ class PredictedDistanceErrorHead(nn.Module):
         self.linear = Linear(self.c_z, self.c_out, **linear_init_params.linear)
 
     def _compute_logits(self, zij: torch.Tensor):
-        logits = self.linear(self.layer_norm(zij))
-        logits = logits + logits.transpose(-2, -3)
-        return logits
-
-    def _chunk(
-        self,
-        zij: torch.Tensor,
-    ) -> torch.Tensor:
-        zij_out = torch.zeros(
-            (*zij.shape[:-1], self.c_out), device=zij.device, dtype=zij.dtype
+        return _streamed_pair_head_logits(
+            self.layer_norm, self.linear, zij, self.c_out, add_transpose=True
         )
-        no_samples = zij.shape[-4]
-        for i in range(no_samples):
-            zij_out[..., i : i + 1, :, :, :] = self._compute_logits(
-                zij[..., i : i + 1, :, :, :]
-            )
-
-        return zij_out
 
     def forward(self, zij, apply_per_sample: bool = False):
         """
@@ -488,20 +499,13 @@ class PredictedDistanceErrorHead(nn.Module):
             zij:
                 [*, N, N, C_z] Pair embedding
             apply_per_sample:
-                Run PDE head for each sample individually.
-                This is a memory optimization which is only used during
-                validation/inference and will depend on the number of samples
-                in the full rollout.
+                Kept for call-site compatibility. Inference already streams
+                samples and I-rows inside ``_compute_logits``.
         Returns:
             logits:
                 [*, N, N, C_out] Logits
         """
-        if apply_per_sample:
-            logits = self._chunk(zij=zij)
-        else:
-            logits = self._compute_logits(zij=zij)
-
-        return logits
+        return self._compute_logits(zij=zij)
 
 
 class PerResidueLDDTAllAtom(nn.Module):
