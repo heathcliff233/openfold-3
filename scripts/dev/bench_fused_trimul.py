@@ -225,9 +225,7 @@ def bench_inference(n: int, precision: str, outgoing: bool) -> list[dict]:
 
 def _print_inference(rows):
     print("INFERENCE (c=128 out/in; abs_err vs matching-precision eager)")
-    print(
-        "cuEq bf16-mixed uses matching bf16 weights; other paths keep fp32 masters."
-    )
+    print("cuEq bf16-mixed uses matching bf16 weights; other paths keep fp32 masters.")
     print(
         f"{'prec':>11} | {'dir':>3} | {'N':>4} | {'path':>11} | "
         f"{'abs_err':>9} | {'rel_err':>9} | {'peak':>8} | {'ms':>7} | {'vs eager':>8}"
@@ -255,7 +253,21 @@ def _print_inference(rows):
     print()
 
 
-def _cueq_trimul(z, mask, wa_p, wa_g, wb_p, wb_g, wz, wg, ln_in_w, ln_in_b, ln_out_w, ln_out_b, outgoing):
+def _cueq_trimul(
+    z,
+    mask,
+    wa_p,
+    wa_g,
+    wb_p,
+    wb_g,
+    wz,
+    wg,
+    ln_in_w,
+    ln_in_b,
+    ln_out_w,
+    ln_out_b,
+    outgoing,
+):
     if triangle_multiplicative_update is None:
         raise RuntimeError("cuequivariance_torch is not installed")
     return triangle_multiplicative_update(
@@ -332,9 +344,7 @@ def bench_checkpointed(n: int, precision: str, path: str, outgoing: bool) -> dic
 def _print_checkpointed(rows):
     print("CHECKPOINTED TRAINING (non-reentrant, same-precision trimul, out/in)")
     print("AMD Triton is inference-only (in-place overwrite, no autograd).")
-    print(
-        "cuEq bf16-mixed uses matching bf16 weights; other paths keep fp32 masters."
-    )
+    print("cuEq bf16-mixed uses matching bf16 weights; other paths keep fp32 masters.")
     print(
         f"{'prec':>11} | {'dir':>3} | {'path':>6} | {'N':>4} | {'peak':>7} | "
         f"{'fwd':>7} | {'bwd':>7} | {'full':>7} | {'vs eager':>8}"

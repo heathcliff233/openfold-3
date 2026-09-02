@@ -72,9 +72,7 @@ def _wrap_flash(timer: _Timer):
         do = do if do.is_contiguous() else do.contiguous()
         rows, j, heads, ch = q.shape
         split = min(fta._BWD_BIAS_SPLIT, max(rows, 1))
-        dq_acc = torch.empty(
-            (rows, j, heads, ch), device=q.device, dtype=torch.float32
-        )
+        dq_acc = torch.empty((rows, j, heads, ch), device=q.device, dtype=torch.float32)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         dummy = q

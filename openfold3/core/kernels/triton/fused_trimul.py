@@ -21,9 +21,14 @@ LN_in → gated A/B projections → triangle einsum → LN_out → gated output
 [+ residual]. ``M`` / sequence length is not an autotune or specialize key.
 GEMM and LN tiles autotune on ``GEMM_MODE`` (LN on an empty key) so each
 GPU picks its own winner. Packed ``[C,B,N,N]`` panels keep a constexpr
-inner stride of 1 (layout, not target length). Forward materializes LN_in
-once, then dual-gemm and the output-gate MMAs load matching dtypes (bf16
-masters are downcast once; no in-loop LN).
+inner stride of 1 (layout, not target length). The unchunked forward
+materializes LN_in once, then dual-gemm and the output-gate MMAs load
+matching dtypes (bf16 masters are downcast once; no in-loop LN).
+Chunked inference streams ``B`` (outgoing) and ``X`` (incoming) in
+``chunk_cap`` row tiles so those full-pair buffers are never allocated.
+When the residual is not ``z``, LN_in is also rematerialized per tile
+from ``z`` (no 1U ``z_hat``). In-place residual keeps a ``z_hat``
+snapshot so later tiles do not read overwritten pair rows.
 Backward keeps ``X`` / ``dX`` / ``dA`` / ``dB`` CH and rematerializes
 LN_out stats in the output-gate kernels. Gated ``dW``/``dX`` load ``dA``/``dB``
 as ``[C,M]``.
@@ -387,7 +392,9 @@ if _TRITON_AVAILABLE:
         return tl.dot(a, b, acc, input_precision="ieee", out_dtype=tl.float32)
 
     @triton.jit
-    def _pid_mn(M, N, TILE_M: tl.constexpr, TILE_N: tl.constexpr, GROUP_M: tl.constexpr):
+    def _pid_mn(
+        M, N, TILE_M: tl.constexpr, TILE_N: tl.constexpr, GROUP_M: tl.constexpr
+    ):
         pid_m_raw = tl.program_id(0)
         pid_n_raw = tl.program_id(1)
         num_pid_m = tl.cdiv(M, TILE_M)
@@ -948,7 +955,9 @@ if _TRITON_AVAILABLE:
             s = tl.sigmoid(_dot_f32(x, tl.trans(wg), GEMM_MODE))
             scale = go
             if HAS_MASK:
-                mtile = tl.load(Mask_ptr + offs_m, mask=m_mask, other=0.0).to(tl.float32)
+                mtile = tl.load(Mask_ptr + offs_m, mask=m_mask, other=0.0).to(
+                    tl.float32
+                )
                 scale = scale * mtile[:, None]
             d_p = scale * s
             d_s = scale * p * s * (1.0 - s)
@@ -1154,9 +1163,7 @@ if _TRITON_AVAILABLE:
         dxh = dx_hat * gamma[None, :]
         grad_mean = tl.sum(dxh, axis=1) / CH
         grad_proj = tl.sum(dxh * x_norm, axis=1) / CH
-        dx = rstd[:, None] * (
-            dxh - grad_mean[:, None] - x_norm * grad_proj[:, None]
-        )
+        dx = rstd[:, None] * (dxh - grad_mean[:, None] - x_norm * grad_proj[:, None])
         tl.store(
             DX_ptr + offs_ch[:, None] * m64 + offs_m64[None, :],
             tl.trans(dx).to(DX_ptr.dtype.element_ty),
@@ -1287,7 +1294,6 @@ if _TRITON_AVAILABLE:
             acc_wg,
             mask=n_mask[:, None] & cz_mask[None, :],
         )
-
 
     @triton.autotune(
         configs=_ln_bwd_configs(),
@@ -1632,9 +1638,7 @@ def gated_out_from_dm(
         raise ValueError(f"x_dm has M={x_m}, expected {m}")
     if ch < 128:
         x_out = ln_transpose(x_dm, ln_out_w, ln_out_b, eps=ln_out_eps)
-        return gated_out_gemm_residual(
-            x_hat, x_out, wg, wp, residual, out=out
-        )
+        return gated_out_gemm_residual(x_hat, x_out, wg, wp, residual, out=out)
     if cz > 128 or ch > 128:
         raise ValueError("fused D-major output supports CZ/CH <= 128")
     if out is None:
@@ -1721,8 +1725,25 @@ def _trimul_whole(
     return y
 
 
+def _pair_row_ln(
+    src_2d: torch.Tensor,
+    m0: int,
+    m1: int,
+    ln_in_w: torch.Tensor,
+    ln_in_b: torch.Tensor | None,
+    ln_in_eps: float,
+    already_ln: bool,
+) -> torch.Tensor:
+    """LN one pair-row tile, or return a view when ``src`` is already ``z_hat``."""
+    sl = src_2d[m0:m1]
+    if already_ln:
+        return sl
+    y, _stats = ln_fwd(sl, ln_in_w, ln_in_b, ln_in_eps)
+    return y
+
+
 def _trimul_chunked_outgoing(
-    z_hat: torch.Tensor,
+    ln_src: torch.Tensor,
     mask_flat: torch.Tensor,
     wa_p: torch.Tensor,
     wa_g: torch.Tensor,
@@ -1740,24 +1761,55 @@ def _trimul_chunked_outgoing(
     ln_out_eps: float,
     out: torch.Tensor | None,
     chunk_cap: int,
+    ln_in_w: torch.Tensor,
+    ln_in_b: torch.Tensor | None,
+    ln_in_eps: float,
+    already_ln: bool,
 ) -> torch.Tensor:
+    """Outgoing trimul with streamed ``B`` (and streamed LN when not inplace).
+
+    ``X[i,j] = sum_k A[i,k] B[j,k]``. The live I-block keeps ``A`` and
+    ``X``; ``B`` is rematerialized as J-row tiles so ``b_full`` is never
+    allocated. ``chunk_cap`` is not lifted.
+    """
     m = n * n
-    b_full = gated_dual_gemm(z_hat, wb_p, wb_g, mask_flat)
-    b_4d = b_full.view(c_hidden, 1, n, n)
-    out_2d = out.reshape(m, c_z) if out is not None else torch.empty(
-        (m, c_z), device=z_hat.device, dtype=z_hat.dtype
+    out_2d = (
+        out.reshape(m, c_z)
+        if out is not None
+        else torch.empty((m, c_z), device=ln_src.device, dtype=ln_src.dtype)
     )
     resid_2d = residual.reshape(m, c_z) if residual is not None else None
     for i_start in range(0, n, chunk_cap):
         i_end = min(n, i_start + chunk_cap)
         rows = i_end - i_start
         m0, m1 = i_start * n, i_end * n
-        a_c = gated_dual_gemm(z_hat[m0:m1], wa_p, wa_g, mask_flat[m0:m1])
-        x_c = _contract(a_c.view(c_hidden, 1, rows, n), b_4d, outgoing=True)
-        del a_c
+        z_hat_i = _pair_row_ln(ln_src, m0, m1, ln_in_w, ln_in_b, ln_in_eps, already_ln)
+        a_c = gated_dual_gemm(z_hat_i, wa_p, wa_g, mask_flat[m0:m1])
+        a_4d = a_c.view(c_hidden, 1, rows, n)
+        x_acc = torch.empty(
+            (c_hidden, 1, rows, n), device=ln_src.device, dtype=ln_src.dtype
+        )
+        for j_start in range(0, n, chunk_cap):
+            j_end = min(n, j_start + chunk_cap)
+            j_rows = j_end - j_start
+            n0, n1 = j_start * n, j_end * n
+            if j_start == i_start and j_end == i_end:
+                z_hat_j = z_hat_i
+            else:
+                z_hat_j = _pair_row_ln(
+                    ln_src, n0, n1, ln_in_w, ln_in_b, ln_in_eps, already_ln
+                )
+            b_c = gated_dual_gemm(z_hat_j, wb_p, wb_g, mask_flat[n0:n1])
+            x_acc[:, :, :, j_start:j_end] = _contract(
+                a_4d, b_c.view(c_hidden, 1, j_rows, n), outgoing=True
+            )
+            del b_c
+            if z_hat_j is not z_hat_i:
+                del z_hat_j
+        del a_c, a_4d
         gated_out_from_dm(
-            z_hat[m0:m1],
-            x_c.reshape(c_hidden, rows * n),
+            z_hat_i,
+            x_acc.reshape(c_hidden, rows * n),
             wg,
             wz,
             resid_2d[m0:m1] if resid_2d is not None else None,
@@ -1766,12 +1818,12 @@ def _trimul_chunked_outgoing(
             ln_out_eps=ln_out_eps,
             out=out_2d[m0:m1],
         )
-        del x_c
+        del x_acc, z_hat_i
     return out_2d.view(1, n, n, c_z)
 
 
 def _trimul_chunked_incoming(
-    z_hat: torch.Tensor,
+    ln_src: torch.Tensor,
     mask_flat: torch.Tensor,
     wa_p: torch.Tensor,
     wa_g: torch.Tensor,
@@ -1789,45 +1841,67 @@ def _trimul_chunked_incoming(
     ln_out_eps: float,
     out: torch.Tensor | None,
     chunk_cap: int,
+    ln_in_w: torch.Tensor,
+    ln_in_b: torch.Tensor | None,
+    ln_in_eps: float,
+    already_ln: bool,
 ) -> torch.Tensor:
+    """Incoming trimul with streamed ``X`` (and streamed LN when not inplace).
+
+    ``X[i,j] = sum_k A[k,i] B[k,j]``. Each I-block accumulates only
+    ``[C, rows, N]``; K-slabs of ``A``/``B`` are rematerialized so a
+    full-pair ``x_accum`` is never allocated. ``chunk_cap`` is not lifted.
+    """
     m = n * n
     group_size = min(64, c_hidden)
-    grouped_k_cap = min(n, chunk_cap * c_hidden // group_size)
-    x_accum = torch.empty((c_hidden, n, n), device=z_hat.device, dtype=z_hat.dtype)
-    for c_start in range(0, c_hidden, group_size):
-        c_end = min(c_hidden, c_start + group_size)
-        channels = c_end - c_start
-        wp_ab = torch.cat([wa_p[c_start:c_end], wb_p[c_start:c_end]], dim=0)
-        wg_ab = torch.cat([wa_g[c_start:c_end], wb_g[c_start:c_end]], dim=0)
-        x_group = x_accum[c_start:c_end]
-        first_chunk = True
-        for k_start in range(0, n, grouped_k_cap):
-            k_end = min(n, k_start + grouped_k_cap)
-            k_rows = k_end - k_start
-            m0, m1 = k_start * n, k_end * n
-            ab_k = gated_dual_gemm(z_hat[m0:m1], wp_ab, wg_ab, mask_flat[m0:m1])
-            a_k = ab_k[:channels].view(channels, k_rows, n)
-            b_k = ab_k[channels:].view(channels, k_rows, n)
-            with torch.amp.autocast(device_type="cuda", enabled=False):
-                if first_chunk:
-                    torch.bmm(a_k.transpose(1, 2), b_k, out=x_group)
-                    first_chunk = False
-                else:
-                    torch.baddbmm(x_group, a_k.transpose(1, 2), b_k, out=x_group)
-            del ab_k, a_k, b_k
-
-    out_2d = out.reshape(m, c_z) if out is not None else torch.empty(
-        (m, c_z), device=z_hat.device, dtype=z_hat.dtype
+    # Do not expand K with ``c_hidden // group_size``: that rebuilds a
+    # pair-sized ``ab_k`` and cancels the streamed-``X`` save.
+    grouped_k_cap = min(n, chunk_cap)
+    out_2d = (
+        out.reshape(m, c_z)
+        if out is not None
+        else torch.empty((m, c_z), device=ln_src.device, dtype=ln_src.dtype)
     )
     resid_2d = residual.reshape(m, c_z) if residual is not None else None
     for i_start in range(0, n, chunk_cap):
         i_end = min(n, i_start + chunk_cap)
         rows = i_end - i_start
         m0, m1 = i_start * n, i_end * n
-        x_dm = x_accum[:, i_start:i_end, :].reshape(c_hidden, rows * n).contiguous()
+        z_hat_i = _pair_row_ln(ln_src, m0, m1, ln_in_w, ln_in_b, ln_in_eps, already_ln)
+        x_acc = torch.zeros(
+            (c_hidden, rows, n), device=ln_src.device, dtype=ln_src.dtype
+        )
+        for k_start in range(0, n, grouped_k_cap):
+            k_end = min(n, k_start + grouped_k_cap)
+            k_rows = k_end - k_start
+            k0, k1 = k_start * n, k_end * n
+            if k_start == i_start and k_end == i_end:
+                z_hat_k = z_hat_i
+            else:
+                z_hat_k = _pair_row_ln(
+                    ln_src, k0, k1, ln_in_w, ln_in_b, ln_in_eps, already_ln
+                )
+            for c_start in range(0, c_hidden, group_size):
+                c_end = min(c_hidden, c_start + group_size)
+                channels = c_end - c_start
+                wp_ab = torch.cat([wa_p[c_start:c_end], wb_p[c_start:c_end]], dim=0)
+                wg_ab = torch.cat([wa_g[c_start:c_end], wb_g[c_start:c_end]], dim=0)
+                ab_k = gated_dual_gemm(z_hat_k, wp_ab, wg_ab, mask_flat[k0:k1])
+                a_k = (
+                    ab_k[:channels]
+                    .view(channels, k_rows, n)[:, :, i_start:i_end]
+                    .contiguous()
+                )
+                b_k = ab_k[channels:].view(channels, k_rows, n)
+                x_group = x_acc[c_start:c_end]
+                with torch.amp.autocast(device_type="cuda", enabled=False):
+                    torch.baddbmm(x_group, a_k.transpose(1, 2), b_k, out=x_group)
+                del ab_k, a_k, b_k
+            if z_hat_k is not z_hat_i:
+                del z_hat_k
         gated_out_from_dm(
-            z_hat[m0:m1],
-            x_dm,
+            z_hat_i,
+            x_acc.reshape(c_hidden, rows * n),
             wg,
             wz,
             resid_2d[m0:m1] if resid_2d is not None else None,
@@ -1836,7 +1910,7 @@ def _trimul_chunked_incoming(
             ln_out_eps=ln_out_eps,
             out=out_2d[m0:m1],
         )
-        del x_dm
+        del x_acc, z_hat_i
     return out_2d.view(1, n, n, c_z)
 
 
@@ -1869,7 +1943,6 @@ def _launch_fused_trimul(
         if mask is not None
         else z_c.new_ones(z_2d.shape[0])
     )
-    z_hat, stats = ln_fwd(z_2d, ln_in_w, ln_in_b, ln_in_eps)
     inplace = (
         residual is not None
         and residual.data_ptr() == z_c.data_ptr()
@@ -1886,6 +1959,17 @@ def _launch_fused_trimul(
         out=out,
     )
     if chunk_cap is not None and chunk_cap < n and batch == 1:
+        if return_acts:
+            raise RuntimeError("fused_trimul training acts are not used with chunk_cap")
+        # In-place writes overwrite pair rows that later tiles still need
+        # as ``B`` / incoming ``K``. Keep a full ``z_hat`` snapshot then.
+        # Otherwise rematerialize LN_in per tile from ``z`` (no 1U ``z_hat``).
+        if inplace:
+            ln_src, _stats = ln_fwd(z_2d, ln_in_w, ln_in_b, ln_in_eps)
+            already_ln = True
+        else:
+            ln_src = z_2d
+            already_ln = False
         chunk_kwargs = dict(
             n=n,
             c_z=c_z,
@@ -1894,12 +1978,14 @@ def _launch_fused_trimul(
             ln_out_eps=ln_out_eps,
             out=out,
             chunk_cap=chunk_cap,
+            ln_in_w=ln_in_w,
+            ln_in_b=ln_in_b,
+            ln_in_eps=ln_in_eps,
+            already_ln=already_ln,
         )
-        if return_acts:
-            raise RuntimeError("fused_trimul training acts are not used with chunk_cap")
         if outgoing:
             return _trimul_chunked_outgoing(
-                z_hat,
+                ln_src,
                 mask_flat,
                 wa_p,
                 wa_g,
@@ -1912,7 +1998,7 @@ def _launch_fused_trimul(
                 **chunk_kwargs,
             )
         return _trimul_chunked_incoming(
-            z_hat,
+            ln_src,
             mask_flat,
             wa_p,
             wa_g,
@@ -1924,6 +2010,7 @@ def _launch_fused_trimul(
             ln_out_b,
             **chunk_kwargs,
         )
+    z_hat, stats = ln_fwd(z_2d, ln_in_w, ln_in_b, ln_in_eps)
     return _trimul_whole(
         z_c,
         z_hat,
@@ -2171,7 +2258,9 @@ def _tri_gemm(
     )
 
 
-def _trimul_da_ch(d_x_ch: torch.Tensor, b: torch.Tensor, outgoing: bool) -> torch.Tensor:
+def _trimul_da_ch(
+    d_x_ch: torch.Tensor, b: torch.Tensor, outgoing: bool
+) -> torch.Tensor:
     """``dA`` as ``[C, M]`` so gated ``dW``/``dX`` skip a pair transpose."""
     hidden, batch, n, _ = b.shape
     d_a_ch = torch.empty_like(d_x_ch)
@@ -2203,7 +2292,9 @@ def _trimul_da_ch(d_x_ch: torch.Tensor, b: torch.Tensor, outgoing: bool) -> torc
     return d_a_ch.view(hidden, -1)
 
 
-def _trimul_db_ch(d_x_ch: torch.Tensor, a: torch.Tensor, outgoing: bool) -> torch.Tensor:
+def _trimul_db_ch(
+    d_x_ch: torch.Tensor, a: torch.Tensor, outgoing: bool
+) -> torch.Tensor:
     hidden, batch, n, _ = a.shape
     d_b_ch = torch.empty_like(d_x_ch)
     mode = _gemm_mode(d_x_ch)
@@ -2427,7 +2518,9 @@ class _FusedTrimulFn(torch.autograd.Function):
             grads[7].to(dtype=ln_in_w.dtype) if need[8] else None,
             grads[8].to(dtype=ln_in_b_t.dtype) if need[9] and ctx.has_ln_in_b else None,
             grads[9].to(dtype=ln_out_w.dtype) if need[10] else None,
-            grads[10].to(dtype=ln_out_b_t.dtype) if need[11] and ctx.has_ln_out_b else None,
+            grads[10].to(dtype=ln_out_b_t.dtype)
+            if need[11] and ctx.has_ln_out_b
+            else None,
             None,
             None,
             None,
@@ -2552,14 +2645,17 @@ def fused_trimul_from_module(
         module.layer_norm_out.weight,
         module.layer_norm_out.bias,
     )
-    if any(linear.bias is not None for linear in (
-        module.linear_a_p,
-        module.linear_a_g,
-        module.linear_b_p,
-        module.linear_b_g,
-        module.linear_z,
-        module.linear_g,
-    )):
+    if any(
+        linear.bias is not None
+        for linear in (
+            module.linear_a_p,
+            module.linear_a_g,
+            module.linear_b_p,
+            module.linear_b_g,
+            module.linear_z,
+            module.linear_g,
+        )
+    ):
         return None
     if not is_fused_trimul_eligible(z, *weights):
         return None

@@ -25,13 +25,15 @@ PairBlock's transposed ending-node view share one kernel (no 1U ``z_norm``).
 Attention is flash / online-softmax: the ``[I, H, J, J]`` score matrix is
 never stored. The forward may group two pair-rows per program so they share
 one triangle-bias load. Training rematerializes QKV from saved ``z`` / LN
-stats and keeps ``LSE`` + ungated ``O`` + triangle bias. Backward uses Triton
-LN / Linear / gate / flash kernels and deterministic exclusive split-M
-``dW``. Gate backward also writes
+stats **by I-row block** (no full-pair ``z_hat``) and keeps ``LSE`` + ungated
+``O`` + triangle bias. Pair-bias ``[H, I, J]`` stays full: every starting row
+needs every ``(j, k)``. Backward uses Triton LN / Linear / gate / flash
+kernels and deterministic exclusive split-M ``dW``. Gate backward also writes
 ``delta = (dO*O).sum(-1)``. Flash backward folds ``dBias`` into ``dQ`` with
 an exclusive I-split (no atomics, no third QK rematerialization). Row-block
-``dBias`` / ``dW`` partials persist and reduce once. In-place residual writes
-are inference-only.
+``dBias`` / ``dW`` partials persist and reduce once. Forward does not clone a
+non-contig ending-node view; pair-LN already stride-decodes ``(i, j)``.
+In-place residual writes are inference-only.
 Ineligible shapes use the matching-precision eager primitives.
 """
 
@@ -290,9 +292,7 @@ if _TRITON_AVAILABLE:
         for cfg in configs:
             it = cfg.kwargs.get("I_TILE", 1)
             if mode == "ieee" and (
-                cfg.kwargs["BLOCK_M"] >= 128
-                or cfg.kwargs["BLOCK_N"] >= 32
-                or it > 1
+                cfg.kwargs["BLOCK_M"] >= 128 or cfg.kwargs["BLOCK_N"] >= 32 or it > 1
             ):
                 continue
             kept.append(cfg)
@@ -497,7 +497,10 @@ if _TRITON_AVAILABLE:
         tb_row = h * stride_tb_h + offs_m * stride_tb_j
         q0_base = i0 * stride_q_i + h * stride_q_h
         q0 = tl.load(
-            Q_ptr + q0_base + offs_m[:, None] * stride_q_j + offs_c[None, :] * stride_q_c,
+            Q_ptr
+            + q0_base
+            + offs_m[:, None] * stride_q_j
+            + offs_c[None, :] * stride_q_c,
             mask=mask_m[:, None],
             other=0.0,
         )
@@ -521,7 +524,8 @@ if _TRITON_AVAILABLE:
             l1 = tl.zeros((BLOCK_M,), dtype=tl.float32)
             o1 = tl.zeros((BLOCK_M, CH), dtype=tl.float32)
             mb1 = (i1 + row_start) * stride_mb_i
-        for n0 in range(0, J_dim, BLOCK_N):
+        # Pipeline K / V / triangle-bias loads (Triton FA ``tl.range``).
+        for n0 in tl.range(0, J_dim, BLOCK_N, num_stages=2):
             offs_n = n0 + tl.arange(0, BLOCK_N)
             mask_n = offs_n < J_dim
             tb = tl.load(
@@ -540,7 +544,9 @@ if _TRITON_AVAILABLE:
             )
             qk0 = _dot_f32(q0, tl.trans(k0), GEMM_MODE) * (softmax_scale * rcp) + tb
             if HAS_MASK:
-                mb = tl.load(Mask_ptr + mb0 + offs_n * stride_mb_j, mask=mask_n, other=0.0)
+                mb = tl.load(
+                    Mask_ptr + mb0 + offs_n * stride_mb_j, mask=mask_n, other=0.0
+                )
                 qk0 = qk0 + (mask_inf * (mb.to(tl.float32) - 1.0))[None, :] * rcp
             qk0 = tl.where(mask_n[None, :], qk0, float("-inf"))
             m0n = tl.maximum(m0, tl.max(qk0, 1))
@@ -570,7 +576,9 @@ if _TRITON_AVAILABLE:
                 qk1 = _dot_f32(q1, tl.trans(k1), GEMM_MODE) * (softmax_scale * rcp) + tb
                 if HAS_MASK:
                     mb = tl.load(
-                        Mask_ptr + mb1 + offs_n * stride_mb_j, mask=mask_n & live1, other=0.0
+                        Mask_ptr + mb1 + offs_n * stride_mb_j,
+                        mask=mask_n & live1,
+                        other=0.0,
                     )
                     qk1 = qk1 + (mask_inf * (mb.to(tl.float32) - 1.0))[None, :] * rcp
                 qk1 = tl.where(mask_n[None, :] & live1, qk1, float("-inf"))
@@ -723,7 +731,7 @@ if _TRITON_AVAILABLE:
         mask_m = offs_m < J_dim
         rcp = RCP_LN2
         tb_row = h * stride_tb_h + offs_m * stride_tb_j
-        for n0 in range(0, J_dim, BLOCK_N):
+        for n0 in tl.range(0, J_dim, BLOCK_N, num_stages=2):
             offs_n = n0 + tl.arange(0, BLOCK_N)
             mask_n = offs_n < J_dim
             tile = mask_m[:, None] & mask_n[None, :]
@@ -873,12 +881,18 @@ if _TRITON_AVAILABLE:
         mask_n = offs_n < J_dim
         q_base = i * stride_q_i + h * stride_q_h
         k = tl.load(
-            K_ptr + q_base + offs_n[:, None] * stride_q_j + offs_c[None, :] * stride_q_c,
+            K_ptr
+            + q_base
+            + offs_n[:, None] * stride_q_j
+            + offs_c[None, :] * stride_q_c,
             mask=mask_n[:, None],
             other=0.0,
         )
         v = tl.load(
-            V_ptr + q_base + offs_n[:, None] * stride_q_j + offs_c[None, :] * stride_q_c,
+            V_ptr
+            + q_base
+            + offs_n[:, None] * stride_q_j
+            + offs_c[None, :] * stride_q_c,
             mask=mask_n[:, None],
             other=0.0,
         )
@@ -887,9 +901,11 @@ if _TRITON_AVAILABLE:
         rcp = RCP_LN2
         mb_base = (i + row_start) * stride_mb_i
         if HAS_MASK:
-            mb = tl.load(Mask_ptr + mb_base + offs_n * stride_mb_j, mask=mask_n, other=0.0)
+            mb = tl.load(
+                Mask_ptr + mb_base + offs_n * stride_mb_j, mask=mask_n, other=0.0
+            )
         tb_col = h * stride_tb_h + offs_n * stride_tb_k
-        for m0 in range(0, J_dim, BLOCK_M):
+        for m0 in tl.range(0, J_dim, BLOCK_M, num_stages=2):
             offs_m = m0 + tl.arange(0, BLOCK_M)
             mask_m = offs_m < J_dim
             tile = mask_m[:, None] & mask_n[None, :]
@@ -916,7 +932,9 @@ if _TRITON_AVAILABLE:
                 mask=mask_m[:, None],
                 other=0.0,
             ).to(tl.float32)
-            lse = tl.load(LSE_ptr + (i * H + h) * J_dim + offs_m, mask=mask_m, other=0.0)
+            lse = tl.load(
+                LSE_ptr + (i * H + h) * J_dim + offs_m, mask=mask_m, other=0.0
+            )
             delta = tl.load(
                 Delta_ptr + (i * H + h) * J_dim + offs_m, mask=mask_m, other=0.0
             )
@@ -994,10 +1012,7 @@ if _TRITON_AVAILABLE:
                 c = offs_n - group * GROUP_C
                 go = tl.load(
                     GO_ptr
-                    + (
-                        group.to(tl.int64)[None, :] * M
-                        + offs_m.to(tl.int64)[:, None]
-                    )
+                    + (group.to(tl.int64)[None, :] * M + offs_m.to(tl.int64)[:, None])
                     * GROUP_C
                     + c[None, :],
                     mask=m_mask[:, None] & n_mask[None, :],
@@ -1025,7 +1040,9 @@ if _TRITON_AVAILABLE:
             for m, warps, stages in _LN_TILES
         ]
 
-    @triton.autotune(configs=_ln_configs(), key=["HAS_LN_BIAS"], restore_value=["Y_ptr"])
+    @triton.autotune(
+        configs=_ln_configs(), key=["HAS_LN_BIAS"], restore_value=["Y_ptr"]
+    )
     @triton.jit(
         do_not_specialize=["M"],
         do_not_specialize_on_alignment=[
@@ -1192,8 +1209,7 @@ if _TRITON_AVAILABLE:
         c = offs_n - group * GROUP_C
         tl.store(
             Y_ptr
-            + (group.to(tl.int64)[None, :] * M + offs_m.to(tl.int64)[:, None])
-            * GROUP_C
+            + (group.to(tl.int64)[None, :] * M + offs_m.to(tl.int64)[:, None]) * GROUP_C
             + c[None, :],
             acc.to(Y_ptr.dtype.element_ty),
             mask=m_mask[:, None] & n_mask[None, :],
@@ -1224,7 +1240,7 @@ if _TRITON_AVAILABLE:
         GROUP_C: tl.constexpr,
         ACCUM_DX: tl.constexpr,
     ):
-        """``dX = dY @ W`` with packed ``dY[M,N]`` or SoA ``dY[N/GROUP_C, M, GROUP_C]``."""
+        """``dX = dY @ W`` packed ``dY[M,N]`` or SoA ``dY[N/GROUP_C,M,GROUP_C]``."""
         pid_m = tl.program_id(0)
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_k = tl.arange(0, BLOCK_K)
@@ -1239,10 +1255,7 @@ if _TRITON_AVAILABLE:
                 c = offs_n - group * GROUP_C
                 dy = tl.load(
                     DY_ptr
-                    + (
-                        group.to(tl.int64)[None, :] * M
-                        + offs_m.to(tl.int64)[:, None]
-                    )
+                    + (group.to(tl.int64)[None, :] * M + offs_m.to(tl.int64)[:, None])
                     * GROUP_C
                     + c[None, :],
                     mask=m_mask[:, None] & n_mask[None, :],
@@ -1550,7 +1563,7 @@ def _ensure_flash_fwd_autotune(
     write_lse: bool,
     mode: str,
 ) -> None:
-    """Time flash-fwd on a large dummy ``J`` so a small first length cannot lock tiles."""
+    """Time flash-fwd on a large dummy ``J`` so a small first length cannot lock."""
     key = _flash_fwd_key(q, heads, ch, has_mask, has_gate, write_lse, mode)
     if key in _flash_autotune_ready:
         return
@@ -1705,7 +1718,7 @@ def _ensure_flash_bwd_autotune(
     has_mask: bool,
     mode: str,
 ) -> None:
-    """Time flash-bwd on a large dummy ``J`` so a small first length cannot lock tiles."""
+    """Time flash-bwd on a large dummy ``J`` so a small first length cannot lock."""
     key = _flash_bwd_key(q, heads, ch, has_mask, mode)
     if key in _flash_bwd_autotune_ready:
         return
@@ -1717,14 +1730,10 @@ def _ensure_flash_bwd_autotune(
     dummy_mask = torch.ones((rows, j), device=q.device, dtype=q.dtype)
     dummy_lse = torch.empty((rows, heads, j), device=q.device, dtype=torch.float32)
     dummy_delta = torch.empty((rows, heads, j), device=q.device, dtype=torch.float32)
-    dummy_dq = torch.empty(
-        (rows, j, heads, ch), device=q.device, dtype=torch.float32
-    )
+    dummy_dq = torch.empty((rows, j, heads, ch), device=q.device, dtype=torch.float32)
     dummy_dk = torch.empty_like(dummy_q)
     dummy_dv = torch.empty_like(dummy_q)
-    dummy_dtb = torch.empty(
-        (split, heads, j, j), device=q.device, dtype=torch.float32
-    )
+    dummy_dtb = torch.empty((split, heads, j, j), device=q.device, dtype=torch.float32)
     shared = dict(
         I_dim=rows,
         J_dim=j,
@@ -2092,8 +2101,10 @@ def _linear_dx(
     w = w if w.is_contiguous() else w.contiguous()
     m, n = dy.shape
     k = w.shape[1]
-    dx = out.reshape(m, k) if out is not None else torch.empty(
-        (m, k), device=dy.device, dtype=dy.dtype
+    dx = (
+        out.reshape(m, k)
+        if out is not None
+        else torch.empty((m, k), device=dy.device, dtype=dy.dtype)
     )
     if m < _LINEAR_WARM_M:
         _ensure_linear_autotune(dy, w, "dx_accum" if accumulate else "dx")
@@ -2130,8 +2141,10 @@ def _linear_dx_soa(
     groups, m, group_c = dy.shape
     n = groups * group_c
     k = w.shape[1]
-    dx = out.reshape(m, k) if out is not None else torch.empty(
-        (m, k), device=dy.device, dtype=dy.dtype
+    dx = (
+        out.reshape(m, k)
+        if out is not None
+        else torch.empty((m, k), device=dy.device, dtype=dy.dtype)
     )
     if m < _LINEAR_WARM_M:
         _ensure_linear_autotune(dy, w, "dx_soa")
@@ -2217,11 +2230,8 @@ def _ln_bwd(
     dx = torch.zeros_like(x)
     n_prog = triton.cdiv(m, min(t[0] for t in _LN_TILES))
     p_gamma = torch.zeros((n_prog, k), dtype=torch.float32, device=x.device)
-    p_beta = (
-        torch.zeros_like(p_gamma)
-        if beta is not None
-        else x.new_empty(1)
-    )
+    p_beta = torch.zeros_like(p_gamma) if beta is not None else x.new_empty(1)
+
     def grid(meta):
         return (triton.cdiv(m, meta["BLOCK_M"]),)
 
@@ -2247,7 +2257,15 @@ def _ln_bwd(
 def _ensure_dx_gate_autotune(
     go: torch.Tensor, wo: torch.Tensor, heads: int, ch: int
 ) -> None:
-    key = (_gemm_mode(go), go.device.type, go.device.index, go.dtype, wo.shape[0], heads, ch)
+    key = (
+        _gemm_mode(go),
+        go.device.type,
+        go.device.index,
+        go.dtype,
+        wo.shape[0],
+        heads,
+        ch,
+    )
     if key in _dx_gate_autotune_ready:
         return
     m = _LINEAR_WARM_M
@@ -2342,6 +2360,27 @@ def _row_block(n_i: int, chunk_size: int | None) -> int:
     return max(1, min(n_i, int(chunk_size)))
 
 
+def _attention_row_block(z: torch.Tensor, start: int, end: int) -> torch.Tensor:
+    """Logical attention-layout rows ``[start:end]`` as contig ``[1, R, J, C]``.
+
+    PairBlock's ending-node call is a transposed view. The pair-LN prologue
+    already stride-decodes the full pair; only this I-block is copied.
+    """
+    block = z[:, start:end]
+    return block if block.is_contiguous() else block.contiguous()
+
+
+def _stats_row_block(
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    start: int,
+    end: int,
+    n_j: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``mean`` / ``rstd`` are flattened ``i * J + j`` in attention layout."""
+    return mean[start * n_j : end * n_j], rstd[start * n_j : end * n_j]
+
+
 def _project_qkvg(z_norm: torch.Tensor, w_qkvg: torch.Tensor, heads: int, ch: int):
     rows, j, c_in = z_norm.shape
     qkvg = _linear_fwd_soa(z_norm.reshape(-1, c_in), w_qkvg)
@@ -2430,8 +2469,8 @@ def _launch_fused_tri_attn(
             mask = mask.transpose(-1, -2)
         if residual is not None:
             residual = residual.transpose(-2, -3)
-    if not z.is_contiguous():
-        z = z.contiguous()
+    # Do not clone a transposed ending-node view. Pair-LN stride-decodes
+    # ``(i, j)``; QKVG contig-copies only the live I-block.
     _, n_i, n_j, c_in = z.shape
     heads, ch = no_heads, c_hidden
     scale = 1.0 / math.sqrt(ch)
@@ -2444,9 +2483,7 @@ def _launch_fused_tri_attn(
     # must not write z + update into that storage. Mini-rollout is also
     # no_grad while the trunk pair still requires grad.
     can_inplace = (
-        residual is not None
-        and not return_acts
-        and not residual.requires_grad
+        residual is not None and not return_acts and not residual.requires_grad
     )
     residual_wv = residual if can_inplace else None
     if residual_wv is not None:
@@ -2464,7 +2501,13 @@ def _launch_fused_tri_attn(
     for start in range(0, n_i, block):
         end = min(n_i, start + block)
         q, k, v, g = _project_block_qkvg(
-            z[:, start:end], ln_w, ln_b, w_qkvg, heads, ch, eps
+            _attention_row_block(z, start, end),
+            ln_w,
+            ln_b,
+            w_qkvg,
+            heads,
+            ch,
+            eps,
         )
         o, lse = _flash_fwd(
             q,
@@ -2536,8 +2579,6 @@ def _fused_tri_attn_backward(
         if mask is not None:
             mask = mask.transpose(-1, -2)
         grad_out = grad_out.transpose(-2, -3)
-    if not z.is_contiguous():
-        z = z.contiguous()
     go = grad_out.contiguous()
     _, n_i, n_j, c_in = z.shape
     heads, ch = no_heads, c_hidden
@@ -2545,15 +2586,13 @@ def _fused_tri_attn_backward(
     ln_w_d, ln_b_d, wz_d, wq, wk, wv, wg, wo = _downcast_masters(
         z.dtype, ln_w, ln_b, wz, wq, wk, wv, wg, wo
     )
-    z_hat = _ln_apply(z.reshape(-1, c_in), mean, rstd, ln_w_d, ln_b_d)
-    z_hat = z_hat.view(1, n_i, n_j, c_in)
     w_qkvg = torch.cat([wq, wk, wv, wg], dim=0)
     mask_c = None
     if mask is not None:
         mask_c = mask if mask.is_contiguous() else mask.contiguous()
         if mask_c.dim() == 3:
             mask_c = mask_c[0]
-    d_z_hat = torch.empty_like(z_hat)
+    d_z_hat = torch.empty((1, n_i, n_j, c_in), device=z.device, dtype=z.dtype)
     d_qkvg_w_partial = torch.empty(
         (_BWD_SPLIT_M, *w_qkvg.shape), device=z.device, dtype=torch.float32
     )
@@ -2569,13 +2608,15 @@ def _fused_tri_attn_backward(
     for start in range(0, n_i, block):
         end = min(n_i, start + block)
         rows = end - start
-        zn = z_hat[0, start:end]
+        z_block = _attention_row_block(z, start, end)
+        mean_b, rstd_b = _stats_row_block(mean, rstd, start, end, n_j)
+        zn = _ln_apply(z_block.reshape(-1, c_in), mean_b, rstd_b, ln_w_d, ln_b_d).view(
+            rows, n_j, c_in
+        )
         q, k, v, g = _project_qkvg(zn, w_qkvg, heads, ch)
         o = o_ungated[start:end]
         go_block = go[0, start:end].reshape(rows * n_j, c_in)
-        d_qkvg = torch.empty(
-            (4, rows * n_j, c_in), device=z.device, dtype=z.dtype
-        )
+        d_qkvg = torch.empty((4, rows * n_j, c_in), device=z.device, dtype=z.dtype)
         d_o, _, attn_gated, delta = _linear_dx_gate_bwd(
             go_block, wo, o, g, dg_out=d_qkvg[3]
         )
@@ -2614,27 +2655,51 @@ def _fused_tri_attn_backward(
             w_qkvg,
             out=d_z_hat[0, start:end],
         )
-        del q, k, v, g, o, d_qkvg
+        del q, k, v, g, o, d_qkvg, zn, z_block
     d_qkvg_w = d_qkvg_w_partial.sum(0)
     d_wo = d_wo_partial.sum(0)
     d_tb = d_tb_partial.sum(0)
-    d_tb_flat = d_tb.permute(1, 2, 0).reshape(-1, heads).to(dtype=z.dtype)
-    d_wz = _split_m_dw(z_hat.reshape(-1, c_in), d_tb_flat).sum(0)
-    _linear_dx(
-        d_tb_flat,
-        wz_d,
-        out=d_z_hat.reshape(-1, c_in),
-        accumulate=True,
-    )
-    d_z, d_ln_w, d_ln_b = _ln_bwd(
-        z.reshape(-1, c_in),
-        d_z_hat.reshape(-1, c_in),
-        mean,
-        rstd,
-        ln_w_d,
-        ln_b_d,
-    )
-    d_z = d_z.view(1, n_i, n_j, c_in)
+    del d_qkvg_w_partial, d_wo_partial, d_tb_partial
+    # Pair-bias dW / dX need complete d_tb. Rematerialize z_hat one I-block
+    # at a time; LN backward overwrites each d_z_hat tile in place.
+    d_wz_partial = None
+    d_ln_w = None
+    d_ln_b = None
+    for start in range(0, n_i, block):
+        end = min(n_i, start + block)
+        rows = end - start
+        z_block = _attention_row_block(z, start, end)
+        mean_b, rstd_b = _stats_row_block(mean, rstd, start, end, n_j)
+        zn = _ln_apply(z_block.reshape(-1, c_in), mean_b, rstd_b, ln_w_d, ln_b_d)
+        d_tb_flat = d_tb[:, start:end, :].permute(1, 2, 0).reshape(-1, heads)
+        d_tb_flat = d_tb_flat.to(dtype=z.dtype)
+        d_wz_partial = _split_m_dw(
+            zn,
+            d_tb_flat,
+            d_wz_partial,
+            accumulate=start > 0,
+        )
+        _linear_dx(
+            d_tb_flat,
+            wz_d,
+            out=d_z_hat[0, start:end],
+            accumulate=True,
+        )
+        dz_b, d_ln_w_b, d_ln_b_b = _ln_bwd(
+            z_block.reshape(-1, c_in),
+            d_z_hat[0, start:end].reshape(-1, c_in),
+            mean_b,
+            rstd_b,
+            ln_w_d,
+            ln_b_d,
+        )
+        d_z_hat[0, start:end] = dz_b.view(rows, n_j, c_in)
+        d_ln_w = d_ln_w_b if d_ln_w is None else d_ln_w + d_ln_w_b
+        if d_ln_b_b is not None:
+            d_ln_b = d_ln_b_b if d_ln_b is None else d_ln_b + d_ln_b_b
+        del zn, z_block, dz_b
+    d_wz = d_wz_partial.sum(0)
+    d_z = d_z_hat
     if has_residual:
         d_z = d_z + go
     if not starting:

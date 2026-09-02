@@ -178,9 +178,7 @@ def test_ending_node_transposed_residual():
     z_t = z.transpose(-2, -3)
     mask_t = mask.transpose(-1, -2)
     with torch.inference_mode():
-        ref = z_t + eager_tri_attn(
-            z_t, mask_t, *_weights(module), **_kwargs(module)
-        )
+        ref = z_t + eager_tri_attn(z_t, mask_t, *_weights(module), **_kwargs(module))
         z_in = z.transpose(-2, -3)
         fused = fused_tri_attn(
             z_in, mask_t, *_weights(module), residual=z_in, **_kwargs(module)
@@ -272,6 +270,23 @@ def test_autograd_incoming_ieee():
     torch.testing.assert_close(z_f.grad, z_e.grad, atol=8e-3, rtol=3e-3)
 
 
+def test_autograd_transposed_view_ieee():
+    """PairBlock ending-node is starting=True on a transposed view."""
+    _set_tf32(False)
+    module = _module(starting=True)
+    z, mask = _pair()
+    z_t = z.transpose(-2, -3)
+    mask_t = mask.transpose(-1, -2)
+    assert not z_t.is_contiguous()
+    z_f = z_t.detach().requires_grad_(True)
+    leaves = [t.detach().requires_grad_(True) for t in _weights(module)]
+    fused_tri_attn(z_f, mask_t, *leaves, **_kwargs(module)).square().mean().backward()
+    z_e = z_t.detach().requires_grad_(True)
+    leaves_e = [t.detach().requires_grad_(True) for t in _weights(module)]
+    eager_tri_attn(z_e, mask_t, *leaves_e, **_kwargs(module)).square().mean().backward()
+    torch.testing.assert_close(z_f.grad, z_e.grad, atol=8e-3, rtol=3e-3)
+
+
 def test_weight_gradients_are_deterministic():
     _set_tf32(False)
     module = _module()
@@ -359,7 +374,6 @@ print(json.dumps({"after_first": after_first, "after_all": after_all}))
         result = subprocess.run(
             [sys.executable, "-c", script],
             env=env,
-            cwd="/workspace/hongliang/of3_dev",
             capture_output=True,
             text=True,
             check=True,

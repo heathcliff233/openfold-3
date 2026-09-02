@@ -160,9 +160,7 @@ def test_with_add_inplace():
         upd = eager_trimul(z, mask, *_weights(module), True)
         ref = z + upd
         z_in = z.clone()
-        fused = fused_trimul(
-            z_in, mask, *_weights(module), True, residual=z_in
-        )
+        fused = fused_trimul(z_in, mask, *_weights(module), True, residual=z_in)
     assert fused.data_ptr() == z_in.data_ptr()
     torch.testing.assert_close(fused, ref, atol=8e-4, rtol=8e-4)
 
@@ -184,6 +182,37 @@ def test_chunked_incoming_matches_whole():
     with torch.inference_mode():
         whole = fused_trimul(z, mask, *_weights(module), False)
         chunked = fused_trimul(z, mask, *_weights(module), False, chunk_cap=32)
+    torch.testing.assert_close(chunked, whole, atol=1e-5, rtol=1e-5)
+
+
+def test_chunked_bf16_matches_whole():
+    _set_tf32(False)
+    module = _module()
+    z, mask = _pair(n=80, dtype=torch.bfloat16)
+    with torch.inference_mode():
+        whole = fused_trimul(z, mask, *_weights(module), True)
+        chunked = fused_trimul(z, mask, *_weights(module), True, chunk_cap=32)
+    assert chunked.dtype == torch.bfloat16
+    torch.testing.assert_close(chunked.float(), whole.float(), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("outgoing", [True, False])
+def test_chunked_inplace_matches_whole(outgoing):
+    _set_tf32(False)
+    module = _module(outgoing=outgoing)
+    z, mask = _pair(n=80)
+    with torch.inference_mode():
+        whole = fused_trimul(z, mask, *_weights(module), outgoing, residual=z.clone())
+        z_in = z.clone()
+        chunked = fused_trimul(
+            z_in,
+            mask,
+            *_weights(module),
+            outgoing,
+            residual=z_in,
+            chunk_cap=32,
+        )
+    assert chunked.data_ptr() == z_in.data_ptr()
     torch.testing.assert_close(chunked, whole, atol=1e-5, rtol=1e-5)
 
 

@@ -133,8 +133,7 @@ def _bench(fn, warmup: int, reps: int) -> tuple[float, float]:
 def _print_row(prec, direction, name, n, ms, u, eager_ms):
     ratio = ms / eager_ms if eager_ms else float("nan")
     print(
-        f"{prec:<12} {direction:<4} {name:<8} {n:5d} {ms:8.2f} "
-        f"{u:7.2f} {ratio:7.2f}x"
+        f"{prec:<12} {direction:<4} {name:<8} {n:5d} {ms:8.2f} {u:7.2f} {ratio:7.2f}x"
     )
 
 
@@ -153,7 +152,8 @@ def main():
     os.environ.setdefault("OPENFOLD3_FUSED_TRI_ATTN_V1", "1")
     infer_ns = tuple(args.n) if args.n else INFER_NS
     header = (
-        f"{'prec':<12} {'dir':<4} {'path':<8} {'N':>5} {'ms':>8} {'U':>7} {'vs eager':>8}"
+        f"{'prec':<12} {'dir':<4} {'path':<8} {'N':>5} "
+        f"{'ms':>8} {'U':>7} {'vs eager':>8}"
     )
     if not args.train_only:
         print("INFERENCE (same-precision TriangleAttention; out=starting, in=ending)")
@@ -170,13 +170,13 @@ def main():
                     u = _u(n)
                     eager_ms = None
 
-                    def eager():
+                    def eager(z=z, mask=mask, weights=weights, kwargs=kwargs):
                         return eager_tri_attn(z, mask, *weights, **kwargs)
 
-                    def fused():
+                    def fused(z=z, mask=mask, weights=weights, kwargs=kwargs):
                         return fused_tri_attn(z, mask, *weights, **kwargs)
 
-                    def fused_res():
+                    def fused_res(z=z, mask=mask, weights=weights, kwargs=kwargs):
                         zin = z.clone()
                         return fused_tri_attn(
                             zin, mask, *weights, residual=zin, **kwargs
@@ -186,7 +186,7 @@ def main():
                     if is_cuequivariance_available():
                         z_c = z.clone()
 
-                        def cueq():
+                        def cueq(module=module, z_c=z_c, mask=mask):
                             return module.forward(
                                 z_c,
                                 mask=mask,
@@ -217,9 +217,7 @@ def main():
         return
     ckpt_ns = tuple(args.n) if args.n and args.train_only else CKPT_NS
     if args.cell is None:
-        print(
-            "CHECKPOINTED TRAINING (non-reentrant fwd+bwd; out=starting, in=ending)"
-        )
+        print("CHECKPOINTED TRAINING (non-reentrant fwd+bwd; out=starting, in=ending)")
         print(header)
         script = os.path.abspath(__file__)
         for starting in DIRECTIONS:
